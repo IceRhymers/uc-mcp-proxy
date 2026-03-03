@@ -1,0 +1,72 @@
+[project]
+name = "uc-mcp-proxy"
+version = "0.1.0"
+description = "MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.8",
+    "databricks-sdk>=0.30.0",
+    "httpx",
+    "anyio",
+]
+license = "MIT"
+readme = "README.md"
+authors = [
+    { name = "Tanner Wendland" },
+]
+keywords = ["mcp", "databricks", "oauth", "proxy", "unity-catalog"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-randomly>=3.15",
+    "anyio[trio]>=4.0",
+]
+
+[project.scripts]
+uc-mcp-proxy = "uc_mcp_proxy.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/IceRhymers/uc-mcp-proxy"
+Repository = "https://github.com/IceRhymers/uc-mcp-proxy"
+Issues = "https://github.com/IceRhymers/uc-mcp-proxy/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uc_mcp_proxy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Pure unit tests with no external dependencies",
+    "integration: Tests that exercise the full proxy flow with mocked transports",
+]
+addopts = "-v --tb=short --strict-markers"
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["uc_mcp_proxy"]
+branch = true
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 75
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "if TYPE_CHECKING:",
+]
