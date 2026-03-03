@@ -37,9 +37,9 @@ dev = [
 uc-mcp-proxy = "uc_mcp_proxy.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/tannerwendland/uc-mcp-proxy"
-Repository = "https://github.com/tannerwendland/uc-mcp-proxy"
-Issues = "https://github.com/tannerwendland/uc-mcp-proxy/issues"
+Homepage = "https://github.com/IceRhymers/uc-mcp-proxy"
+Repository = "https://github.com/IceRhymers/uc-mcp-proxy"
+Issues = "https://github.com/IceRhymers/uc-mcp-proxy/issues"
 
 [build-system]
 requires = ["hatchling"]
