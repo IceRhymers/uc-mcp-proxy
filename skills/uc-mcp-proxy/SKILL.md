@@ -137,4 +137,4 @@ Restart Claude Code/Desktop after editing `.mcp.json`. The proxy must be running
 - Check your workspace firewall/network policies
 
 *`uvx: command not found`*
-Install `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+Install `uv` via `pip install uv` or `brew install uv`. Alternatively, install `uc-mcp-proxy` directly: `pip install uc-mcp-proxy` (always verify the package source is pypi.org/project/uc-mcp-proxy).
