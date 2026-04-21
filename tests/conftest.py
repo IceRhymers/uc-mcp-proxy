@@ -104,8 +104,9 @@ def mock_http_client(http_streams):
     captured = {}
 
     @asynccontextmanager
-    async def _mock(url, *, auth=None, terminate_on_close=True, **kwargs):
+    async def _mock(url, *, headers=None, auth=None, terminate_on_close=True, **kwargs):
         captured["url"] = url
+        captured["headers"] = headers
         captured["auth"] = auth
         captured["terminate_on_close"] = terminate_on_close
         yield (proxy_read, proxy_write, lambda: "mock-session-id")

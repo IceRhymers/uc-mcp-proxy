@@ -38,7 +38,7 @@ def test_default_profile_is_none():
             with patch("uc_mcp_proxy.__main__.asyncio.run"):
                 from uc_mcp_proxy.__main__ import main
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", None, None)
+                mock_run.assert_called_once_with("https://example.com/mcp", None, None, None)
 
 
 def test_creates_workspace_client_with_profile():
@@ -51,7 +51,7 @@ def test_creates_workspace_client_with_profile():
             with patch("uc_mcp_proxy.__main__.asyncio.run"):
                 from uc_mcp_proxy.__main__ import main
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", "MY_PROFILE", None)
+                mock_run.assert_called_once_with("https://example.com/mcp", "MY_PROFILE", None, None)
 
 
 def test_creates_workspace_client_with_auth_type():
@@ -64,4 +64,62 @@ def test_creates_workspace_client_with_auth_type():
             with patch("uc_mcp_proxy.__main__.asyncio.run"):
                 from uc_mcp_proxy.__main__ import main
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", None, "databricks-cli")
+                mock_run.assert_called_once_with("https://example.com/mcp", None, "databricks-cli", None)
+
+
+def test_single_meta_parsed_correctly():
+    """--meta KEY=VALUE is parsed into a dict and passed to run()."""
+    with patch.object(sys, "argv", [
+        "uc-mcp-proxy", "--url", "https://example.com/mcp",
+        "--meta", "warehouse_id=abc123",
+    ]):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+                main()
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", None, None,
+                    {"warehouse_id": "abc123"},
+                )
+
+
+def test_multiple_meta_parsed_correctly():
+    """Multiple --meta flags produce a dict with all entries."""
+    with patch.object(sys, "argv", [
+        "uc-mcp-proxy", "--url", "https://example.com/mcp",
+        "--meta", "warehouse_id=abc123",
+        "--meta", "catalog=main",
+    ]):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+                main()
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", None, None,
+                    {"warehouse_id": "abc123", "catalog": "main"},
+                )
+
+
+def test_meta_without_value_exits_with_error():
+    """--meta bad (no =) produces a non-zero exit."""
+    with patch.object(sys, "argv", [
+        "uc-mcp-proxy", "--url", "https://example.com/mcp",
+        "--meta", "bad",
+    ]):
+        with pytest.raises(SystemExit) as exc_info:
+            from uc_mcp_proxy.__main__ import main
+            main()
+        assert exc_info.value.code == 1
+
+
+def test_no_meta_passes_none():
+    """No --meta flags → meta=None."""
+    with patch.object(sys, "argv", ["uc-mcp-proxy", "--url", "https://example.com/mcp"]):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+                main()
+                mock_run.assert_called_once_with("https://example.com/mcp", None, None, None)
