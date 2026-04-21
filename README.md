@@ -58,6 +58,37 @@ uc-mcp-proxy --url <MCP_SERVER_URL> [--profile <DATABRICKS_PROFILE>] [--auth-typ
 | `--url` | **(required)** Remote MCP server URL |
 | `--profile` | Databricks CLI profile name (uses default if omitted) |
 | `--auth-type` | Databricks auth type, e.g. `databricks-cli` |
+| `--header KEY=VALUE` | Extra HTTP header forwarded to upstream (repeatable) |
+
+## Meta Parameters (Managed MCP)
+
+Databricks Managed MCP servers accept transport-level HTTP headers for configuration — for example, selecting a SQL warehouse or scoping to a catalog/schema. Use `--header` to forward these:
+
+```bash
+uvx uc-mcp-proxy \
+  --url https://workspace.databricks.com/api/2.0/mcp/functions/main/default \
+  --header x-databricks-warehouse-id=abc123 \
+  --header x-databricks-catalog=main \
+  --header x-databricks-schema=default
+```
+
+Or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "sql-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "uc-mcp-proxy",
+        "--url", "https://workspace.databricks.com/api/2.0/mcp/functions/main/default",
+        "--header", "x-databricks-warehouse-id=abc123"
+      ]
+    }
+  }
+}
+```
 
 ## How It Works
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from typing import Generator, AsyncGenerator
 
 import anyio
@@ -62,7 +63,12 @@ async def bridge(
         tg.start_soon(copy_stream, http_read, stdio_write)
 
 
-async def run(url: str, profile: str | None = None, auth_type: str | None = None) -> None:
+async def run(
+    url: str,
+    profile: str | None = None,
+    auth_type: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> None:
     """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth."""
     kwargs: dict = {}
     if profile:
@@ -73,7 +79,7 @@ async def run(url: str, profile: str | None = None, auth_type: str | None = None
     auth = DatabricksAuth(client)
 
     async with stdio_server() as (stdio_read, stdio_write):
-        async with streamablehttp_client(url, auth=auth) as (
+        async with streamablehttp_client(url, headers=headers, auth=auth) as (
             http_read,
             http_write,
             _get_session_id,
@@ -89,8 +95,26 @@ def main() -> None:
     parser.add_argument("--url", required=True, help="Remote MCP server URL")
     parser.add_argument("--profile", default=None, help="Databricks CLI profile")
     parser.add_argument("--auth-type", default=None, help="Databricks auth type (e.g. databricks-cli)")
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra HTTP header forwarded to upstream (e.g. --header x-databricks-warehouse-id=abc123). Repeatable.",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.profile, args.auth_type))
+
+    headers: dict[str, str] | None = None
+    if args.header:
+        headers = {}
+        for h in args.header:
+            key, _, value = h.partition("=")
+            if not value:
+                print(f"Error: --header must be KEY=VALUE, got: {h!r}", file=sys.stderr)
+                sys.exit(1)
+            headers[key] = value
+
+    asyncio.run(run(args.url, args.profile, args.auth_type, headers))
 
 
 if __name__ == "__main__":  # pragma: no cover
