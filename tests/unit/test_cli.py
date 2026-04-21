@@ -67,11 +67,11 @@ def test_creates_workspace_client_with_auth_type():
                 mock_run.assert_called_once_with("https://example.com/mcp", None, "databricks-cli", None)
 
 
-def test_single_header_parsed_correctly():
-    """--header KEY=VALUE is parsed into a dict and passed to run()."""
+def test_single_meta_parsed_correctly():
+    """--meta KEY=VALUE is parsed into a dict and passed to run()."""
     with patch.object(sys, "argv", [
         "uc-mcp-proxy", "--url", "https://example.com/mcp",
-        "--header", "x-databricks-warehouse-id=abc123",
+        "--meta", "warehouse_id=abc123",
     ]):
         with patch("uc_mcp_proxy.__main__.run") as mock_run:
             mock_run.return_value = MagicMock()
@@ -80,16 +80,16 @@ def test_single_header_parsed_correctly():
                 main()
                 mock_run.assert_called_once_with(
                     "https://example.com/mcp", None, None,
-                    {"x-databricks-warehouse-id": "abc123"},
+                    {"warehouse_id": "abc123"},
                 )
 
 
-def test_multiple_headers_parsed_correctly():
-    """Multiple --header flags produce a dict with all entries."""
+def test_multiple_meta_parsed_correctly():
+    """Multiple --meta flags produce a dict with all entries."""
     with patch.object(sys, "argv", [
         "uc-mcp-proxy", "--url", "https://example.com/mcp",
-        "--header", "x-databricks-warehouse-id=abc123",
-        "--header", "x-databricks-catalog=main",
+        "--meta", "warehouse_id=abc123",
+        "--meta", "catalog=main",
     ]):
         with patch("uc_mcp_proxy.__main__.run") as mock_run:
             mock_run.return_value = MagicMock()
@@ -98,18 +98,15 @@ def test_multiple_headers_parsed_correctly():
                 main()
                 mock_run.assert_called_once_with(
                     "https://example.com/mcp", None, None,
-                    {
-                        "x-databricks-warehouse-id": "abc123",
-                        "x-databricks-catalog": "main",
-                    },
+                    {"warehouse_id": "abc123", "catalog": "main"},
                 )
 
 
-def test_header_without_value_exits_with_error():
-    """--header bad (no =) produces a non-zero exit."""
+def test_meta_without_value_exits_with_error():
+    """--meta bad (no =) produces a non-zero exit."""
     with patch.object(sys, "argv", [
         "uc-mcp-proxy", "--url", "https://example.com/mcp",
-        "--header", "bad",
+        "--meta", "bad",
     ]):
         with pytest.raises(SystemExit) as exc_info:
             from uc_mcp_proxy.__main__ import main
@@ -117,8 +114,8 @@ def test_header_without_value_exits_with_error():
         assert exc_info.value.code == 1
 
 
-def test_no_headers_passes_none():
-    """No --header flags → headers=None (backward-compatible)."""
+def test_no_meta_passes_none():
+    """No --meta flags → meta=None."""
     with patch.object(sys, "argv", ["uc-mcp-proxy", "--url", "https://example.com/mcp"]):
         with patch("uc_mcp_proxy.__main__.run") as mock_run:
             mock_run.return_value = MagicMock()

@@ -58,18 +58,18 @@ uc-mcp-proxy --url <MCP_SERVER_URL> [--profile <DATABRICKS_PROFILE>] [--auth-typ
 | `--url` | **(required)** Remote MCP server URL |
 | `--profile` | Databricks CLI profile name (uses default if omitted) |
 | `--auth-type` | Databricks auth type, e.g. `databricks-cli` |
-| `--header KEY=VALUE` | Extra HTTP header forwarded to upstream (repeatable) |
+| `--meta KEY=VALUE` | Meta parameter injected into `tools/call` `_meta` (repeatable) |
 
 ## Meta Parameters (Managed MCP)
 
-Databricks Managed MCP servers accept transport-level HTTP headers for configuration — for example, selecting a SQL warehouse or scoping to a catalog/schema. Use `--header` to forward these:
+Databricks Managed MCP servers accept configuration — for example, selecting a SQL warehouse — via the MCP [`_meta`](https://modelcontextprotocol.io/specification/2025-11-25/basic#_meta) field in the JSON-RPC request body, **not** as HTTP headers. See the Databricks [meta-param docs](https://docs.databricks.com/aws/en/generative-ai/mcp/managed-mcp-meta-param) for the supported keys per server type.
+
+Use `--meta KEY=VALUE` (repeatable) — the proxy merges these into `params._meta` on every outgoing `tools/call` request:
 
 ```bash
 uvx uc-mcp-proxy \
-  --url https://workspace.databricks.com/api/2.0/mcp/functions/main/default \
-  --header x-databricks-warehouse-id=abc123 \
-  --header x-databricks-catalog=main \
-  --header x-databricks-schema=default
+  --url https://workspace.databricks.com/api/2.0/mcp/sql \
+  --meta warehouse_id=abc123
 ```
 
 Or in `.mcp.json`:
@@ -82,13 +82,15 @@ Or in `.mcp.json`:
       "command": "uvx",
       "args": [
         "uc-mcp-proxy",
-        "--url", "https://workspace.databricks.com/api/2.0/mcp/functions/main/default",
-        "--header", "x-databricks-warehouse-id=abc123"
+        "--url", "https://workspace.databricks.com/api/2.0/mcp/sql",
+        "--meta", "warehouse_id=abc123"
       ]
     }
   }
 }
 ```
+
+If the MCP client already sets a `_meta` key that the proxy is also configured to inject, the proxy value wins and a warning is written to stderr.
 
 ## How It Works
 
