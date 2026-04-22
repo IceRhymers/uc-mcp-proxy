@@ -59,6 +59,7 @@ uc-mcp-proxy --url <MCP_SERVER_URL> [--profile <DATABRICKS_PROFILE>] [--auth-typ
 | `--profile` | Databricks CLI profile name (uses default if omitted) |
 | `--auth-type` | Databricks auth type, e.g. `databricks-cli` |
 | `--meta KEY=VALUE` | Meta parameter injected into `tools/call` `_meta` (repeatable) |
+| `--no-verify-ssl` | Disable SSL certificate verification (use with caution — see below) |
 
 ## Meta Parameters (Managed MCP)
 
@@ -91,6 +92,42 @@ Or in `.mcp.json`:
 ```
 
 If the MCP client already sets a `_meta` key that the proxy is also configured to inject, the proxy value wins and a warning is written to stderr.
+
+## SSL Certificate Verification
+
+Some Azure Databricks instances use self-signed or internally-signed certificates that are not trusted by the system's default CA bundle. This causes errors like:
+
+```
+SSL_CERTIFICATE_VERIFY_FAILED: certificate verify failed: unable to get local issuer certificate
+```
+
+Use `--no-verify-ssl` to disable certificate verification:
+
+```bash
+uvx uc-mcp-proxy \
+  --url https://workspace.azuredatabricks.net/api/2.0/mcp/functions/main/default \
+  --no-verify-ssl
+```
+
+Or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "unity-catalog": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "uc-mcp-proxy",
+        "--url", "https://workspace.azuredatabricks.net/api/2.0/mcp/functions/main/default",
+        "--no-verify-ssl"
+      ]
+    }
+  }
+}
+```
+
+> **Security warning:** `--no-verify-ssl` disables all certificate validation, which exposes connections to man-in-the-middle (MITM) attacks. Only use this flag in trusted network environments (e.g. a private corporate VPN) where you control the network path to the Databricks workspace.
 
 ## How It Works
 
