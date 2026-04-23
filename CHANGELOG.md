@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.3.0...v0.4.0) (2026-04-23)
+
+
+### Features
+
+* add ruff + mypy lint checks to CI ([#16](https://github.com/IceRhymers/uc-mcp-proxy/issues/16)) ([ccf3711](https://github.com/IceRhymers/uc-mcp-proxy/commit/ccf371134dcb610e3dfa5a6f9fd9865fe59b1445))
+
 ## [0.3.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.2.0...v0.3.0) (2026-04-23)
 
 
