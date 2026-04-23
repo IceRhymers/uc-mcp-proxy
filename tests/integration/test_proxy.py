@@ -3,21 +3,18 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import asynccontextmanager
+from unittest.mock import patch
 
 import anyio
 import httpx
 import pytest
-from contextlib import asynccontextmanager
-from unittest.mock import patch, MagicMock
-
 from mcp.client.streamable_http import streamable_http_client as _real_streamable_http_client
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
-async def test_proxy_forwards_request_and_response(
-    mock_workspace_client, memory_stream_pair
-):
+async def test_proxy_forwards_request_and_response(mock_workspace_client, memory_stream_pair):
     """End-to-end: request goes in via stdio, arrives on HTTP side;
     response comes back via HTTP, arrives on stdio side."""
     from uc_mcp_proxy.__main__ import run
@@ -63,11 +60,9 @@ async def test_proxy_forwards_request_and_response(
                     await http_in_send.aclose()
 
 
-async def test_proxy_passes_auth_on_http_client(
-    mock_workspace_client, memory_stream_pair
-):
+async def test_proxy_passes_auth_on_http_client(mock_workspace_client, memory_stream_pair):
     """DatabricksAuth is configured on the httpx.AsyncClient handed to streamable_http_client."""
-    from uc_mcp_proxy.__main__ import run, DatabricksAuth
+    from uc_mcp_proxy.__main__ import DatabricksAuth, run
 
     stdio_in_send, stdio_in_recv = memory_stream_pair(16)
     stdio_out_send, stdio_out_recv = memory_stream_pair(16)
@@ -102,9 +97,7 @@ async def test_proxy_passes_auth_on_http_client(
     assert isinstance(captured["http_client"].auth, DatabricksAuth)
 
 
-async def test_proxy_uses_correct_url(
-    mock_workspace_client, memory_stream_pair
-):
+async def test_proxy_uses_correct_url(mock_workspace_client, memory_stream_pair):
     """streamablehttp_client is called with the URL from CLI args."""
     from uc_mcp_proxy.__main__ import run
 
@@ -140,9 +133,7 @@ async def test_proxy_uses_correct_url(
     assert captured["url"] == target_url
 
 
-async def test_run_calls_streamable_http_client_with_supported_kwargs(
-    mock_workspace_client, memory_stream_pair
-):
+async def test_run_calls_streamable_http_client_with_supported_kwargs(mock_workspace_client, memory_stream_pair):
     """Guard: kwargs passed to streamable_http_client must bind to the real SDK signature.
 
     Without this, fakes with **kwargs silently accept misnamed params and the

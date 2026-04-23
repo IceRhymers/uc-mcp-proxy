@@ -16,7 +16,10 @@ def _tools_call(params=None) -> SessionMessage:
     return SessionMessage(
         message=JSONRPCMessage(
             root=JSONRPCRequest(
-                jsonrpc="2.0", id=1, method="tools/call", params=params,
+                jsonrpc="2.0",
+                id=1,
+                method="tools/call",
+                params=params,
             )
         )
     )
@@ -26,7 +29,10 @@ def _tools_list() -> SessionMessage:
     return SessionMessage(
         message=JSONRPCMessage(
             root=JSONRPCRequest(
-                jsonrpc="2.0", id=2, method="tools/list", params={},
+                jsonrpc="2.0",
+                id=2,
+                method="tools/list",
+                params={},
             )
         )
     )
@@ -36,7 +42,9 @@ def _tools_call_no_params() -> SessionMessage:
     return SessionMessage(
         message=JSONRPCMessage(
             root=JSONRPCRequest(
-                jsonrpc="2.0", id=3, method="tools/call",
+                jsonrpc="2.0",
+                id=3,
+                method="tools/call",
             )
         )
     )
