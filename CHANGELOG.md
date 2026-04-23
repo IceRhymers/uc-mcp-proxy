@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.2.0...v0.3.0) (2026-04-23)
+
+
+### Features
+
+* add --no-verify-ssl flag for self-signed certificate environments ([66f0d19](https://github.com/IceRhymers/uc-mcp-proxy/commit/66f0d19ad451d6c7503fae1e9bc55a684427a03c))
+* add --no-verify-ssl flag for self-signed certificate support ([09f7513](https://github.com/IceRhymers/uc-mcp-proxy/commit/09f75132e53f33509383706ec183fe86a254ba0a)), closes [#12](https://github.com/IceRhymers/uc-mcp-proxy/issues/12)
+
+
+### Bug Fixes
+
+* update streamable_http_client import and enhance HTTP client configuration ([c31209f](https://github.com/IceRhymers/uc-mcp-proxy/commit/c31209f8275d869dae823efbb520aa8927a00204))
+
+
+### Documentation
+
+* add --no-verify-ssl section to README ([f1c6d7a](https://github.com/IceRhymers/uc-mcp-proxy/commit/f1c6d7aa6af31ca2bbeb0c5d3558217e0f7aee61))
+
 ## [0.2.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.1.1...v0.2.0) (2026-04-21)
 
 
