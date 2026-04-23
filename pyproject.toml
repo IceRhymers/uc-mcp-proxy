@@ -31,6 +31,8 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-randomly>=3.15",
     "anyio[trio]>=4.0",
+    "ruff>=0.11",
+    "mypy>=1.15",
 ]
 
 [project.scripts]
@@ -70,3 +72,25 @@ exclude_lines = [
     "if __name__ == .__main__.",
     "if TYPE_CHECKING:",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "SIM117"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+packages = ["uc_mcp_proxy"]
+strict = true
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["anyio.*", "mcp.*", "databricks.*"]
+ignore_missing_imports = true

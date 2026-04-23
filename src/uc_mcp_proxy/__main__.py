@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from typing import Generator, AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
+from typing import Any
 
 import anyio
 import httpx
@@ -33,7 +34,7 @@ class DatabricksAuth(httpx.Auth):
         # Also forward the token so the Databricks App can use per-user identity
         auth_value = headers.get("Authorization", "")
         if auth_value.startswith("Bearer "):
-            request.headers["X-Forwarded-Access-Token"] = auth_value[len("Bearer "):]
+            request.headers["X-Forwarded-Access-Token"] = auth_value[len("Bearer ") :]
 
     def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         self._apply_headers(request)
@@ -44,7 +45,7 @@ class DatabricksAuth(httpx.Auth):
         yield request
 
 
-async def copy_stream(source: MemoryObjectReceiveStream, dest: MemoryObjectSendStream) -> None:
+async def copy_stream(source: MemoryObjectReceiveStream[Any], dest: MemoryObjectSendStream[Any]) -> None:
     """Copy all messages from source to dest, closing dest when source is exhausted."""
     try:
         async for message in source:
@@ -86,8 +87,8 @@ def inject_meta(
 
 
 async def inject_meta_stream(
-    source: MemoryObjectReceiveStream,
-    dest: MemoryObjectSendStream,
+    source: MemoryObjectReceiveStream[Any],
+    dest: MemoryObjectSendStream[Any],
     meta: dict[str, str],
 ) -> None:
     """Like copy_stream, but applies inject_meta to each forwarded message."""
@@ -99,10 +100,10 @@ async def inject_meta_stream(
 
 
 async def bridge(
-    stdio_read: MemoryObjectReceiveStream,
-    stdio_write: MemoryObjectSendStream,
-    http_read: MemoryObjectReceiveStream,
-    http_write: MemoryObjectSendStream,
+    stdio_read: MemoryObjectReceiveStream[Any],
+    stdio_write: MemoryObjectSendStream[Any],
+    http_read: MemoryObjectReceiveStream[Any],
+    http_write: MemoryObjectSendStream[Any],
     meta: dict[str, str] | None = None,
 ) -> None:
     """Bidirectional bridge between stdio and HTTP stream pairs.
@@ -127,7 +128,7 @@ async def run(
     verify_ssl: bool = True,
 ) -> None:
     """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth."""
-    kwargs: dict = {}
+    kwargs: dict[str, Any] = {}
     if profile:
         kwargs["profile"] = profile
     if auth_type:
@@ -135,22 +136,24 @@ async def run(
     client = WorkspaceClient(**kwargs)
     auth = DatabricksAuth(client)
 
-    async with stdio_server() as (stdio_read, stdio_write):
-        async with httpx.AsyncClient(
+    async with (
+        stdio_server() as (stdio_read, stdio_write),
+        httpx.AsyncClient(
             follow_redirects=True,
             verify=verify_ssl,
             timeout=httpx.Timeout(30.0, read=300.0),
             auth=auth,
-        ) as httpx_client:
-            async with streamable_http_client(
-                url,
-                http_client=httpx_client,
-            ) as (
-                http_read,
-                http_write,
-                _get_session_id,
-            ):
-                await bridge(stdio_read, stdio_write, http_read, http_write, meta)
+        ) as httpx_client,
+        streamable_http_client(
+            url,
+            http_client=httpx_client,
+        ) as (
+            http_read,
+            http_write,
+            _get_session_id,
+        ),
+    ):
+        await bridge(stdio_read, stdio_write, http_read, http_write, meta)
 
 
 def main() -> None:
@@ -181,8 +184,7 @@ def main() -> None:
 
     if args.no_verify_ssl:
         print(
-            "warning: SSL certificate verification is disabled (--no-verify-ssl). "
-            "Use only in trusted environments.",
+            "warning: SSL certificate verification is disabled (--no-verify-ssl). Use only in trusted environments.",
             file=sys.stderr,
         )
 

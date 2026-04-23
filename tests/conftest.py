@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import pytest
-import httpx
-import anyio
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock
 
+import anyio
+import pytest
 
 # ---------------------------------------------------------------------------
 # Databricks SDK fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def mock_workspace_client():
@@ -22,15 +22,14 @@ def mock_workspace_client():
     """
     client = MagicMock()
     client.config.host = "https://test-workspace.cloud.databricks.com"
-    client.config.authenticate.return_value = {
-        "Authorization": "Bearer test-oauth-token"
-    }
+    client.config.authenticate.return_value = {"Authorization": "Bearer test-oauth-token"}
     return client
 
 
 # ---------------------------------------------------------------------------
 # Stream fixtures (real anyio memory streams, not mocks)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def memory_stream_pair():
@@ -39,8 +38,10 @@ def memory_stream_pair():
     Usage:
         send, recv = memory_stream_pair(buffer=16)
     """
+
     def _make(buffer: int = 16):
         return anyio.create_memory_object_stream(buffer)
+
     return _make
 
 
@@ -77,6 +78,7 @@ def http_streams(memory_stream_pair):
 # ---------------------------------------------------------------------------
 # Transport mock fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def mock_stdio_server(stdio_streams):
@@ -119,16 +121,19 @@ def mock_http_client(http_streams):
 # Auth fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def databricks_auth(mock_workspace_client):
     """Pre-configured DatabricksAuth instance."""
     from uc_mcp_proxy import DatabricksAuth
+
     return DatabricksAuth(mock_workspace_client)
 
 
 # ---------------------------------------------------------------------------
 # Sample message fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def sample_jsonrpc_request():
