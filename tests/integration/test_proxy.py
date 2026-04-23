@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
+
 import anyio
+import httpx
 import pytest
 from contextlib import asynccontextmanager
 from unittest.mock import patch, MagicMock
+
+from mcp.client.streamable_http import streamable_http_client as _real_streamable_http_client
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -39,7 +44,7 @@ async def test_proxy_forwards_request_and_response(
 
     with patch("uc_mcp_proxy.__main__.WorkspaceClient", return_value=mock_workspace_client):
         with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
-            with patch("uc_mcp_proxy.__main__.streamablehttp_client", side_effect=fake_http):
+            with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(run, "https://example.com/mcp", None)
 
@@ -58,10 +63,10 @@ async def test_proxy_forwards_request_and_response(
                     await http_in_send.aclose()
 
 
-async def test_proxy_passes_auth_directly(
+async def test_proxy_passes_auth_on_http_client(
     mock_workspace_client, memory_stream_pair
 ):
-    """DatabricksAuth is passed directly to streamablehttp_client via auth=."""
+    """DatabricksAuth is configured on the httpx.AsyncClient handed to streamable_http_client."""
     from uc_mcp_proxy.__main__ import run, DatabricksAuth
 
     stdio_in_send, stdio_in_recv = memory_stream_pair(16)
@@ -76,13 +81,13 @@ async def test_proxy_passes_auth_directly(
     captured = {}
 
     @asynccontextmanager
-    async def fake_http(url, *, auth=None, **kwargs):
-        captured["auth"] = auth
+    async def fake_http(url, *, http_client=None, **kwargs):
+        captured["http_client"] = http_client
         yield (http_in_recv, http_out_send, lambda: "mock-session-id")
 
     with patch("uc_mcp_proxy.__main__.WorkspaceClient", return_value=mock_workspace_client):
         with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
-            with patch("uc_mcp_proxy.__main__.streamablehttp_client", side_effect=fake_http):
+            with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(run, "https://example.com/mcp", None)
 
@@ -93,8 +98,8 @@ async def test_proxy_passes_auth_directly(
                     await stdio_in_send.aclose()
                     await http_in_send.aclose()
 
-    assert captured["auth"] is not None
-    assert isinstance(captured["auth"], DatabricksAuth)
+    assert isinstance(captured["http_client"], httpx.AsyncClient)
+    assert isinstance(captured["http_client"].auth, DatabricksAuth)
 
 
 async def test_proxy_uses_correct_url(
@@ -123,7 +128,7 @@ async def test_proxy_uses_correct_url(
 
     with patch("uc_mcp_proxy.__main__.WorkspaceClient", return_value=mock_workspace_client):
         with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
-            with patch("uc_mcp_proxy.__main__.streamablehttp_client", side_effect=fake_http):
+            with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(run, target_url, "DEFAULT")
 
@@ -133,3 +138,49 @@ async def test_proxy_uses_correct_url(
                     await http_in_send.aclose()
 
     assert captured["url"] == target_url
+
+
+async def test_run_calls_streamable_http_client_with_supported_kwargs(
+    mock_workspace_client, memory_stream_pair
+):
+    """Guard: kwargs passed to streamable_http_client must bind to the real SDK signature.
+
+    Without this, fakes with **kwargs silently accept misnamed params and the
+    bug only surfaces at runtime against a live server.
+    """
+    from uc_mcp_proxy.__main__ import run
+
+    stdio_in_send, stdio_in_recv = memory_stream_pair(16)
+    stdio_out_send, stdio_out_recv = memory_stream_pair(16)
+    http_in_send, http_in_recv = memory_stream_pair(16)
+    http_out_send, http_out_recv = memory_stream_pair(16)
+
+    @asynccontextmanager
+    async def fake_stdio():
+        yield (stdio_in_recv, stdio_out_send)
+
+    captured_args: tuple = ()
+    captured_kwargs: dict = {}
+
+    @asynccontextmanager
+    async def fake_http(*args, **kwargs):
+        nonlocal captured_args
+        captured_args = args
+        captured_kwargs.update(kwargs)
+        yield (http_in_recv, http_out_send, lambda: "mock-session-id")
+
+    with patch("uc_mcp_proxy.__main__.WorkspaceClient", return_value=mock_workspace_client):
+        with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
+            with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(run, "https://example.com/mcp", None, None, None, False)
+                    await anyio.sleep(0)
+                    await stdio_in_send.aclose()
+                    await http_in_send.aclose()
+
+    # Bind the captured call against the real SDK signature — this raises
+    # TypeError if our kwargs don't match what the installed mcp exposes.
+    sig = inspect.signature(_real_streamable_http_client)
+    sig.bind(*captured_args, **captured_kwargs)
+
+    assert isinstance(captured_kwargs["http_client"], httpx.AsyncClient)

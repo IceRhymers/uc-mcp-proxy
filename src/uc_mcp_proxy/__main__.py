@@ -11,7 +11,7 @@ import anyio
 import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from databricks.sdk import WorkspaceClient
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest
@@ -124,6 +124,7 @@ async def run(
     profile: str | None = None,
     auth_type: str | None = None,
     meta: dict[str, str] | None = None,
+    verify_ssl: bool = True,
 ) -> None:
     """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth."""
     kwargs: dict = {}
@@ -135,12 +136,21 @@ async def run(
     auth = DatabricksAuth(client)
 
     async with stdio_server() as (stdio_read, stdio_write):
-        async with streamablehttp_client(url, auth=auth) as (
-            http_read,
-            http_write,
-            _get_session_id,
-        ):
-            await bridge(stdio_read, stdio_write, http_read, http_write, meta)
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            verify=verify_ssl,
+            timeout=httpx.Timeout(30.0, read=300.0),
+            auth=auth,
+        ) as httpx_client:
+            async with streamable_http_client(
+                url,
+                http_client=httpx_client,
+            ) as (
+                http_read,
+                http_write,
+                _get_session_id,
+            ):
+                await bridge(stdio_read, stdio_write, http_read, http_write, meta)
 
 
 def main() -> None:
@@ -162,7 +172,19 @@ def main() -> None:
             "on key collision with client-provided _meta."
         ),
     )
+    parser.add_argument(
+        "--no-verify-ssl",
+        action="store_true",
+        help="Disable SSL certificate verification (for self-signed certificates).",
+    )
     args = parser.parse_args()
+
+    if args.no_verify_ssl:
+        print(
+            "warning: SSL certificate verification is disabled (--no-verify-ssl). "
+            "Use only in trusted environments.",
+            file=sys.stderr,
+        )
 
     meta: dict[str, str] | None = None
     if args.meta:
@@ -174,7 +196,7 @@ def main() -> None:
                 sys.exit(1)
             meta[key] = value
 
-    asyncio.run(run(args.url, args.profile, args.auth_type, meta))
+    asyncio.run(run(args.url, args.profile, args.auth_type, meta, verify_ssl=not args.no_verify_ssl))
 
 
 if __name__ == "__main__":  # pragma: no cover
