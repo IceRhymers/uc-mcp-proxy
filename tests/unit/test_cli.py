@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sys
+from contextlib import asynccontextmanager
 from unittest.mock import patch, MagicMock
 
+import anyio
+import httpx
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -167,3 +170,44 @@ def test_without_no_verify_ssl_defaults_to_verify_true():
                 main()
                 _, kwargs = mock_run.call_args
                 assert kwargs.get("verify_ssl", True) is True
+
+
+@pytest.mark.parametrize("verify_ssl", [True, False])
+def test_run_builds_httpx_client_with_expected_verify(mock_workspace_client, verify_ssl):
+    """run(verify_ssl=...) constructs httpx.AsyncClient with the matching verify= kwarg.
+
+    This is the load-bearing plumbing check for --no-verify-ssl: prove the flag
+    actually reaches the httpx constructor, not just the run() signature.
+    """
+    from uc_mcp_proxy.__main__ import run
+
+    captured: dict = {}
+    real_async_client = httpx.AsyncClient
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_async_client(*args, **kwargs)
+
+    @asynccontextmanager
+    async def fake_stdio():
+        send_a, recv_a = anyio.create_memory_object_stream(1)
+        send_b, recv_b = anyio.create_memory_object_stream(1)
+        # Close source sends so bridge()'s copy_stream tasks EOF immediately
+        # and run() returns without hanging.
+        await send_a.aclose()
+        yield (recv_a, send_b)
+
+    @asynccontextmanager
+    async def fake_http(url, *, http_client=None, **kwargs):
+        send_a, recv_a = anyio.create_memory_object_stream(1)
+        send_b, recv_b = anyio.create_memory_object_stream(1)
+        await send_a.aclose()
+        yield (recv_a, send_b, lambda: "mock-session-id")
+
+    with patch("uc_mcp_proxy.__main__.WorkspaceClient", return_value=mock_workspace_client):
+        with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
+            with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
+                with patch("uc_mcp_proxy.__main__.httpx.AsyncClient", side_effect=spy):
+                    anyio.run(run, "https://example.com/mcp", None, None, None, verify_ssl)
+
+    assert captured.get("verify") is verify_ssl

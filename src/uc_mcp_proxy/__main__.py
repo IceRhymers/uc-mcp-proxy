@@ -11,7 +11,7 @@ import anyio
 import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from databricks.sdk import WorkspaceClient
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest
@@ -136,8 +136,16 @@ async def run(
     auth = DatabricksAuth(client)
 
     async with stdio_server() as (stdio_read, stdio_write):
-        async with httpx.AsyncClient(verify=verify_ssl) as httpx_client:
-            async with streamablehttp_client(url, auth=auth, httpx_client=httpx_client) as (
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            verify=verify_ssl,
+            timeout=httpx.Timeout(30.0, read=300.0),
+            auth=auth,
+        ) as httpx_client:
+            async with streamable_http_client(
+                url,
+                http_client=httpx_client,
+            ) as (
                 http_read,
                 http_write,
                 _get_session_id,
