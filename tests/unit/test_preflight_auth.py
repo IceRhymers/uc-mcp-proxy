@@ -192,6 +192,36 @@ class TestEagerConstructorFailure:
         runner.assert_not_called()
         assert "DATABRICKS_TOKEN" in str(excinfo.value)
 
+    def test_constructor_value_error_uses_databricks_config_profile_env(self, tmp_path, monkeypatch):
+        """When --profile is unset, fall back to DATABRICKS_CONFIG_PROFILE before DEFAULT.
+
+        Regression test for the case where a user has DATABRICKS_CONFIG_PROFILE=prod
+        set in their environment and no --profile flag — we must read the [prod]
+        section from ~/.databrickscfg, not [DEFAULT].
+        """
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text(
+            "[DEFAULT]\nhost = https://default.example.com\nauth_type = pat\ntoken = dapi-default\n"
+            "[prod]\nhost = https://prod.example.com\nauth_type = databricks-cli\n"
+        )
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "prod")
+
+        good = _mk_client(auth_type="databricks-cli", profile="prod")
+        runner = _ok_runner()
+
+        with patch(
+            "uc_mcp_proxy.auth.WorkspaceClient",
+            side_effect=[ValueError("refresh token invalid"), good],
+        ):
+            result = _preflight_authenticate(None, None, runner=runner)
+
+        assert result is good
+        runner.assert_called_once()
+        cmd = runner.call_args.args[0]
+        # MUST be --profile prod (from the env var), not --profile DEFAULT.
+        assert cmd == ["databricks", "auth", "login", "--profile", "prod"]
+
 
 # ---------------------------------------------------------------------------
 # _read_auth_type_from_cfg direct coverage

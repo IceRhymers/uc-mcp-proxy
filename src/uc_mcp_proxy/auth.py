@@ -84,7 +84,10 @@ def _preflight_authenticate(
         # WorkspaceClient() itself blew up — we can't read client.config.
         # Recover auth_type from the caller's args or, failing that,
         # ~/.databrickscfg so we still make the right recovery decision.
-        resolved_profile = profile or "DEFAULT"
+        # Profile name comes from --profile, then DATABRICKS_CONFIG_PROFILE,
+        # then the SDK's "DEFAULT" fallback — matching the SDK's own
+        # resolution order in Config.__init__.
+        resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
         resolved_auth_type = auth_type or _read_auth_type_from_cfg(resolved_profile) or "(auto-detect)"
 
     if resolved_auth_type not in _RECOVERABLE_AUTH_TYPES:
