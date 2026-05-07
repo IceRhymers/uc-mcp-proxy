@@ -5,11 +5,20 @@ MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth.
 ## Commands
 
 - `uv sync` — install all dependencies (including dev)
-- `uv run pytest -m unit -v` — run unit tests only
-- `uv run pytest -m integration -v` — run integration tests only
-- `uv run pytest -v` — run all tests
-- `uv run pytest -m unit --cov -v` — unit tests with coverage
+- `make test` / `make test-unit` — run unit tests only (default, what CI runs)
+- `make test-cov` — unit tests with coverage
+- `make test-integration` — run integration tests only (**fires real Databricks auth, can open a browser**)
+- `make test-all` — run unit + integration
+- `make check` — ruff lint + ruff format-check + mypy
+- `make fmt` — auto-format and fix lint
 - `uv build` — build sdist + wheel into `dist/`
+
+## Test policy
+
+Integration tests intentionally exercise the real preflight auth flow,
+including `databricks auth login` (which pops a browser). They must never
+run in CI and should not be the default target. `make test` runs unit
+tests only to match CI.
 
 ## Architecture
 

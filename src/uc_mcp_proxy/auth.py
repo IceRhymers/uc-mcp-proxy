@@ -18,9 +18,12 @@ auth type gets an auth-type-specific remediation message and a clean exit.
 
 from __future__ import annotations
 
+import configparser
+import os
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
@@ -62,18 +65,27 @@ def _preflight_authenticate(
     if auth_type:
         kwargs["auth_type"] = auth_type
 
-    client = WorkspaceClient(**kwargs)
+    # The SDK authenticates eagerly in ``Config.__init__`` — a stale OAuth
+    # refresh token raises straight out of ``WorkspaceClient(**kwargs)``
+    # (wrapped as ``ValueError``), before we can call ``authenticate()``.
+    # So construction and authenticate() must share the same except block.
+    client: WorkspaceClient | None = None
     try:
+        client = WorkspaceClient(**kwargs)
         client.config.authenticate()
         return client
-    except (PermissionDenied, DatabricksError):
+    except (PermissionDenied, DatabricksError, ValueError):
         pass  # fall through to login
 
-    # Determine the resolved auth_type. The SDK populates this from the
-    # ``auth_type`` field in the profile, the ``auth_type`` kwarg, or
-    # auto-detects from which credentials are present.
-    resolved_auth_type = client.config.auth_type or "(auto-detect)"
-    resolved_profile = client.config.profile or "DEFAULT"
+    if client is not None:
+        resolved_auth_type = client.config.auth_type or "(auto-detect)"
+        resolved_profile = client.config.profile or "DEFAULT"
+    else:
+        # WorkspaceClient() itself blew up — we can't read client.config.
+        # Recover auth_type from the caller's args or, failing that,
+        # ~/.databrickscfg so we still make the right recovery decision.
+        resolved_profile = profile or "DEFAULT"
+        resolved_auth_type = auth_type or _read_auth_type_from_cfg(resolved_profile) or "(auto-detect)"
 
     if resolved_auth_type not in _RECOVERABLE_AUTH_TYPES:
         # Non-OAuth auth — we can't safely re-run ``databricks auth login``
@@ -156,3 +168,27 @@ def _diagnose_non_oauth_auth(auth_type: str, profile: str) -> str:
         f"because that would overwrite your existing ~/.databrickscfg entry. "
         f"Refresh your credentials manually."
     )
+
+
+def _read_auth_type_from_cfg(profile: str) -> str | None:
+    """Read ``auth_type`` for ``profile`` from ``~/.databrickscfg``.
+
+    Returns ``None`` if the file is absent, unreadable, or missing the
+    profile/field. Used only as a fallback when ``WorkspaceClient()`` itself
+    raises (eager auth in ``Config.__init__``) so we can't inspect
+    ``client.config.auth_type``.
+    """
+    path_str = os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg"
+    path = Path(path_str).expanduser()
+    if not path.is_file():
+        return None
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error:
+        return None
+    try:
+        section = parser[profile]
+    except KeyError:
+        return None
+    return section.get("auth_type")

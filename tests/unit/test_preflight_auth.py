@@ -13,6 +13,7 @@ from uc_mcp_proxy.auth import (
     _RECOVERABLE_AUTH_TYPES,
     _diagnose_non_oauth_auth,
     _preflight_authenticate,
+    _read_auth_type_from_cfg,
 )
 
 pytestmark = pytest.mark.unit
@@ -122,6 +123,109 @@ class TestOAuthU2M:
         with _patch_workspace(bad, still_bad):
             with pytest.raises(PermissionDenied):
                 _preflight_authenticate(None, None, runner=runner)
+
+
+# ---------------------------------------------------------------------------
+# WorkspaceClient() itself raises (eager auth in Config.__init__)
+# ---------------------------------------------------------------------------
+
+
+class TestEagerConstructorFailure:
+    """The SDK authenticates eagerly in ``Config.__init__``, so a stale OAuth
+    refresh token raises ``ValueError`` out of ``WorkspaceClient(**kwargs)``
+    before we reach ``client.config.authenticate()``. Make sure we still run
+    ``databricks auth login`` in that path."""
+
+    def test_constructor_value_error_triggers_login_when_cfg_has_databricks_cli(self, tmp_path, monkeypatch):
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[e2-demo]\nhost = https://example.cloud.databricks.com\nauth_type = databricks-cli\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+        good = _mk_client(auth_type="databricks-cli", profile="e2-demo")
+        runner = _ok_runner()
+
+        with patch(
+            "uc_mcp_proxy.auth.WorkspaceClient",
+            side_effect=[ValueError("refresh token invalid"), good],
+        ):
+            result = _preflight_authenticate("e2-demo", None, runner=runner)
+
+        assert result is good
+        runner.assert_called_once()
+        cmd = runner.call_args.args[0]
+        assert cmd == ["databricks", "auth", "login", "--profile", "e2-demo"]
+
+    def test_constructor_value_error_with_explicit_pat_does_not_login(self, tmp_path, monkeypatch):
+        """If the caller passed ``auth_type=pat`` and construction raises, we
+        must not touch ~/.databrickscfg with ``databricks auth login``."""
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[DEFAULT]\nhost = https://x\ntoken = dapi-test\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+        runner = MagicMock()
+        with (
+            patch(
+                "uc_mcp_proxy.auth.WorkspaceClient",
+                side_effect=ValueError("pat invalid"),
+            ),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _preflight_authenticate(None, "pat", runner=runner)
+
+        runner.assert_not_called()
+        assert "developer/access-tokens" in str(excinfo.value)
+
+    def test_constructor_value_error_unknown_profile_falls_back_to_autodetect(self, tmp_path, monkeypatch):
+        """No cfg file + no auth_type arg → ``(auto-detect)`` diagnosis, no login."""
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing.cfg"))
+
+        runner = MagicMock()
+        with (
+            patch(
+                "uc_mcp_proxy.auth.WorkspaceClient",
+                side_effect=ValueError("no creds"),
+            ),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _preflight_authenticate(None, None, runner=runner)
+
+        runner.assert_not_called()
+        assert "DATABRICKS_TOKEN" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# _read_auth_type_from_cfg direct coverage
+# ---------------------------------------------------------------------------
+
+
+class TestReadAuthTypeFromCfg:
+    def test_reads_auth_type_for_named_profile(self, tmp_path, monkeypatch):
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[e2-demo]\nhost = https://example\nauth_type = databricks-cli\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        assert _read_auth_type_from_cfg("e2-demo") == "databricks-cli"
+
+    def test_returns_none_when_file_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "nope.cfg"))
+        assert _read_auth_type_from_cfg("DEFAULT") is None
+
+    def test_returns_none_when_profile_absent(self, tmp_path, monkeypatch):
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[other]\nhost = https://x\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        assert _read_auth_type_from_cfg("missing") is None
+
+    def test_returns_none_when_field_absent(self, tmp_path, monkeypatch):
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[myprof]\nhost = https://x\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        assert _read_auth_type_from_cfg("myprof") is None
+
+    def test_malformed_file_returns_none(self, tmp_path, monkeypatch):
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("not a valid ini [[[")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        assert _read_auth_type_from_cfg("anything") is None
 
 
 # ---------------------------------------------------------------------------
