@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Run unit tests
-        run: uv run pytest -m unit -v --cov
+        run: make test-cov
 
       - name: Build package
         run: uv build

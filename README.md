@@ -16,6 +16,30 @@ uv tool install uc-mcp-proxy
 
 Requires Python 3.10+.
 
+## First-run authentication
+
+uc-mcp-proxy expects a configured Databricks CLI profile. Set one up first:
+
+    databricks configure --host https://<workspace>
+
+Then pass it to the proxy:
+
+    uvx uc-mcp-proxy --url <MCP_SERVER_URL> --profile <name>
+
+If the profile uses OAuth U2M (`auth_type = databricks-cli`) and the cached
+token is expired, uc-mcp-proxy runs `databricks auth login --profile <name>`
+automatically the first time it launches, opening a browser tab. Subsequent
+runs use the refreshed token.
+
+**uc-mcp-proxy will only auto-login for OAuth (`databricks-cli`) profiles.**
+For PAT, M2M, Azure, or other auth types, the proxy diagnoses the failure
+and points you at the right remediation — it never runs `databricks auth
+login` against a non-OAuth profile because that would overwrite your
+existing credentials in `~/.databrickscfg`.
+
+To skip the auto-login (CI / headless), pass `--no-auto-login` and ensure
+`DATABRICKS_TOKEN` or another credential is set in the environment.
+
 ## Databricks MCP Server Types
 
 | Server Type | URL Pattern |

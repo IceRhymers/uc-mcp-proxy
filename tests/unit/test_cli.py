@@ -42,7 +42,9 @@ def test_default_profile_is_none():
                 from uc_mcp_proxy.__main__ import main
 
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", None, None, None, verify_ssl=True)
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", None, None, None, verify_ssl=True, no_auto_login=False
+                )
 
 
 def test_creates_workspace_client_with_profile():
@@ -54,7 +56,9 @@ def test_creates_workspace_client_with_profile():
                 from uc_mcp_proxy.__main__ import main
 
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", "MY_PROFILE", None, None, verify_ssl=True)
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", "MY_PROFILE", None, None, verify_ssl=True, no_auto_login=False
+                )
 
 
 def test_creates_workspace_client_with_auth_type():
@@ -70,7 +74,9 @@ def test_creates_workspace_client_with_auth_type():
             from uc_mcp_proxy.__main__ import main
 
             main()
-            mock_run.assert_called_once_with("https://example.com/mcp", None, "databricks-cli", None, verify_ssl=True)
+            mock_run.assert_called_once_with(
+                "https://example.com/mcp", None, "databricks-cli", None, verify_ssl=True, no_auto_login=False
+            )
 
 
 def test_single_meta_parsed_correctly():
@@ -100,6 +106,7 @@ def test_single_meta_parsed_correctly():
                 None,
                 {"warehouse_id": "abc123"},
                 verify_ssl=True,
+                no_auto_login=False,
             )
 
 
@@ -132,6 +139,7 @@ def test_multiple_meta_parsed_correctly():
                 None,
                 {"warehouse_id": "abc123", "catalog": "main"},
                 verify_ssl=True,
+                no_auto_login=False,
             )
 
 
@@ -164,7 +172,9 @@ def test_no_meta_passes_none():
                 from uc_mcp_proxy.__main__ import main
 
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", None, None, None, verify_ssl=True)
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", None, None, None, verify_ssl=True, no_auto_login=False
+                )
 
 
 def test_no_verify_ssl_passes_verify_ssl_false():
@@ -176,7 +186,9 @@ def test_no_verify_ssl_passes_verify_ssl_false():
                 from uc_mcp_proxy.__main__ import main
 
                 main()
-                mock_run.assert_called_once_with("https://example.com/mcp", None, None, None, verify_ssl=False)
+                mock_run.assert_called_once_with(
+                    "https://example.com/mcp", None, None, None, verify_ssl=False, no_auto_login=False
+                )
 
 
 def test_no_verify_ssl_prints_warning(capsys):
@@ -242,6 +254,6 @@ def test_run_builds_httpx_client_with_expected_verify(mock_workspace_client, ver
         with patch("uc_mcp_proxy.__main__.stdio_server", side_effect=fake_stdio):
             with patch("uc_mcp_proxy.__main__.streamable_http_client", side_effect=fake_http):
                 with patch("uc_mcp_proxy.__main__.httpx.AsyncClient", side_effect=spy):
-                    anyio.run(run, "https://example.com/mcp", None, None, None, verify_ssl)
+                    anyio.run(run, "https://example.com/mcp", None, None, None, verify_ssl, True)
 
     assert captured.get("verify") is verify_ssl

@@ -17,6 +17,8 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest
 
+from uc_mcp_proxy.auth import _preflight_authenticate
+
 
 class DatabricksAuth(httpx.Auth):
     """httpx Auth that injects fresh Databricks OAuth tokens per-request.
@@ -126,14 +128,18 @@ async def run(
     auth_type: str | None = None,
     meta: dict[str, str] | None = None,
     verify_ssl: bool = True,
+    no_auto_login: bool = False,
 ) -> None:
     """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth."""
-    kwargs: dict[str, Any] = {}
-    if profile:
-        kwargs["profile"] = profile
-    if auth_type:
-        kwargs["auth_type"] = auth_type
-    client = WorkspaceClient(**kwargs)
+    if no_auto_login:
+        kwargs: dict[str, Any] = {}
+        if profile:
+            kwargs["profile"] = profile
+        if auth_type:
+            kwargs["auth_type"] = auth_type
+        client = WorkspaceClient(**kwargs)
+    else:
+        client = _preflight_authenticate(profile, auth_type)
     auth = DatabricksAuth(client)
 
     async with (
@@ -180,6 +186,15 @@ def main() -> None:
         action="store_true",
         help="Disable SSL certificate verification (for self-signed certificates).",
     )
+    parser.add_argument(
+        "--no-auto-login",
+        action="store_true",
+        help=(
+            "Skip the auto-login preflight. Fail immediately if credentials are "
+            "missing or expired. Use in CI / headless contexts where no browser "
+            "is available."
+        ),
+    )
     args = parser.parse_args()
 
     if args.no_verify_ssl:
@@ -198,7 +213,16 @@ def main() -> None:
                 sys.exit(1)
             meta[key] = value
 
-    asyncio.run(run(args.url, args.profile, args.auth_type, meta, verify_ssl=not args.no_verify_ssl))
+    asyncio.run(
+        run(
+            args.url,
+            args.profile,
+            args.auth_type,
+            meta,
+            verify_ssl=not args.no_verify_ssl,
+            no_auto_login=args.no_auto_login,
+        )
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
