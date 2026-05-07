@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.3.0...v0.4.0) (2026-05-07)
+
+
+### Features
+
+* add ruff + mypy lint checks to CI ([#16](https://github.com/IceRhymers/uc-mcp-proxy/issues/16)) ([ccf3711](https://github.com/IceRhymers/uc-mcp-proxy/commit/ccf371134dcb610e3dfa5a6f9fd9865fe59b1445))
+* auto-trigger `databricks auth login` for OAuth profiles when credentials are missing ([#19](https://github.com/IceRhymers/uc-mcp-proxy/issues/19)) ([6e633c2](https://github.com/IceRhymers/uc-mcp-proxy/commit/6e633c2c06b512cc5e171b7d483287c959ba70db))
+
 ## [0.3.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.2.0...v0.3.0) (2026-04-23)
 
 
