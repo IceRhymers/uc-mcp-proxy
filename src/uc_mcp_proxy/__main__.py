@@ -7,6 +7,7 @@ import asyncio
 import sys
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import anyio
 import httpx
@@ -122,6 +123,24 @@ async def bridge(
         tg.start_soon(copy_stream, http_read, stdio_write)
 
 
+def _resolve_url(url: str, client: WorkspaceClient) -> str:
+    """Resolve ``url`` against the workspace host from ``client.config``.
+
+    If ``url`` already has a scheme (e.g. ``https://...``) it is returned
+    unchanged. Otherwise it is joined against ``client.config.host`` so that
+    callers can pass a workspace-relative path like ``/api/2.0/mcp/foo``.
+    """
+    if urlsplit(url).scheme:
+        return url
+    host = client.config.host
+    if not host:
+        raise SystemExit(
+            f"uc-mcp-proxy: --url {url!r} is relative but no workspace host is configured in the Databricks profile."
+        )
+    base = host if host.endswith("/") else host + "/"
+    return urljoin(base, url.lstrip("/"))
+
+
 async def run(
     url: str,
     profile: str | None = None,
@@ -130,7 +149,11 @@ async def run(
     verify_ssl: bool = True,
     no_auto_login: bool = False,
 ) -> None:
-    """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth."""
+    """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth.
+
+    ``url`` may be absolute or workspace-relative; relative values are resolved
+    against ``client.config.host`` from the Databricks profile.
+    """
     if no_auto_login:
         kwargs: dict[str, Any] = {}
         if profile:
@@ -141,6 +164,7 @@ async def run(
     else:
         client = _preflight_authenticate(profile, auth_type)
     auth = DatabricksAuth(client)
+    resolved_url = _resolve_url(url, client)
 
     async with (
         stdio_server() as (stdio_read, stdio_write),
@@ -151,7 +175,7 @@ async def run(
             auth=auth,
         ) as httpx_client,
         streamable_http_client(
-            url,
+            resolved_url,
             http_client=httpx_client,
         ) as (
             http_read,
@@ -167,7 +191,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth",
     )
-    parser.add_argument("--url", required=True, help="Remote MCP server URL")
+    parser.add_argument(
+        "--url",
+        required=True,
+        help=(
+            "Remote MCP server URL. Accepts an absolute URL "
+            "(https://workspace/api/2.0/mcp/...) or a workspace-relative path "
+            "(/api/2.0/mcp/...), which is resolved against the host from the "
+            "Databricks profile."
+        ),
+    )
     parser.add_argument("--profile", default=None, help="Databricks CLI profile")
     parser.add_argument("--auth-type", default=None, help="Databricks auth type (e.g. databricks-cli)")
     parser.add_argument(
