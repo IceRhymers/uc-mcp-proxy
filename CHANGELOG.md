@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.4.0...v0.5.0) (2026-05-17)
+
+
+### Features
+
+* Support workspace-relative URL resolution ([de0ab4e](https://github.com/IceRhymers/uc-mcp-proxy/commit/de0ab4ece38437eb4084a1870c12d2498872deec))
+
 ## [0.4.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.3.0...v0.4.0) (2026-05-07)
 
 
