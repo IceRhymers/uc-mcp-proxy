@@ -114,6 +114,24 @@ stopped being true, a server-chosen `mcp-session-id` containing spaces drove the
 match into catastrophic backtracking: 5.8 seconds at nine spaces, growing ~3.5×
 per space, on the thread that also runs the abort path.
 
+**Redaction is bounded defence, not a guarantee — say so before hardening it
+further.** It protects against a server that *echoes back* what it was sent,
+which is a cooperative mistake. It cannot protect against a hostile server:
+anything able to echo a credential already holds that credential. The controls
+that actually contain one are the controls that stop it being sent — the `pat`
+carve-out on `X-Forwarded-Access-Token`, the cross-origin guard, and the HTTPS
+floor on the token endpoint. Four review rounds went into this function and each
+fix introduced a new hole; the honest limit is now written into its docstring.
+
+**Redact by span, never by sequential replacement.** `mcp-session-id` is chosen
+by the server, bounded by nothing, and used as a redaction needle. Replacing
+secrets one at a time lets each rewrite the string the next one searches, so a
+server that overlaps the real credential by a single character destroys its
+match and leaves the rest in the clear. Spans are located against the original
+text and spliced once, which makes the result order-independent. Applying the
+longest secret first is *not* a substitute — that was the previous fix, and it
+is what made the attack work.
+
 **Truncation is the recurring hazard.** Nothing may cut between the read and
 `scrub_body`, because a cut severs a secret and the surviving half matches
 nothing. That bug shipped twice — once as an 8 KiB redaction window, once as a

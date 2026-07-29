@@ -1279,3 +1279,86 @@ def test_a_secret_that_prefixes_another_does_not_shadow_it():
     from uc_mcp_proxy.errors import scrub_body
 
     assert scrub_body("x AAAABBBB y", ["AAAA", "AAAABBBB"]) == "x <redacted> y"
+
+
+# ---------------------------------------------------------------------------
+# 33: redaction must not depend on the order secrets happen to be in
+# ---------------------------------------------------------------------------
+
+
+#: Long enough to exceed any pattern cap, because a real OIDC token is: an
+#: RS256 signature alone is 342 base64url characters. A PAT-only fixture hides
+#: every defect that only bites above the cap.
+JWT_LIKE = "eyJhbGciOiJSUzI1NiJ9." + "A" * 480
+PAT_LIKE = "dapi0123456789abcdef0123456789ab"
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n", "­", "​"], ids=["space", "tab", "nl", "shy", "zwsp"])
+def test_a_long_token_keeps_separator_tolerance(separator):
+    """A credential past the pattern cap must not silently lose tolerance.
+
+    The cap exists to bound the cost of a *server-chosen* needle. Applying it to
+    our own token turned separator tolerance off for every OIDC JWT -- which is
+    exactly what this branch mints -- while remaining invisible to any test that
+    only ever uses a 36-character PAT.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    split = JWT_LIKE[:100] + separator + JWT_LIKE[100:]
+
+    result = scrub_body(f"denied {split}", [JWT_LIKE])
+
+    assert JWT_LIKE[:100] not in result, "a 100-character run of the token reached the output"
+    assert "<redacted>" in result
+
+
+def test_a_server_chosen_secret_cannot_consume_the_real_one():
+    """``mcp-session-id`` is server-chosen and unbounded; it must not preempt.
+
+    Redacting secrets one after another lets each one rewrite the string the
+    next one searches. A server that overlaps the real credential by a single
+    character -- and makes its own value longer, so it is processed first --
+    destroys the real credential's own match and leaves the rest in the clear.
+    Spans are computed against the original text for exactly this reason.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    session_id = "A" * 64 + PAT_LIKE[0]
+    body = "upstream refused: " + "A" * 64 + PAT_LIKE
+
+    result = scrub_body(body, [PAT_LIKE, session_id])
+
+    assert PAT_LIKE[1:] not in result, f"leaked all but one character: {result!r}"
+    assert PAT_LIKE not in result
+
+
+def test_redaction_is_order_independent():
+    """The same secrets in either order must give the same output."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    session_id = "A" * 64 + PAT_LIKE[0]
+    body = "upstream refused: " + "A" * 64 + PAT_LIKE
+
+    assert scrub_body(body, [PAT_LIKE, session_id]) == scrub_body(body, [session_id, PAT_LIKE])
+
+
+@pytest.mark.parametrize(
+    "codepoint",
+    [0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800],
+    ids=["choseong", "jungseong", "hangul_filler", "halfwidth", "braille_blank"],
+)
+def test_invisible_non_format_characters_cannot_hide_a_secret(codepoint):
+    """Blank-rendering characters outside ``Cf`` were not being stripped.
+
+    The Hangul fillers are ``Lo`` and the braille blank is ``So``, so a category
+    test for ``Cc``/``Cf`` misses them -- while a terminal renders each as
+    nothing, leaving the credential plainly readable in a log.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    hidden = chr(codepoint).join(PAT_LIKE)
+
+    result = scrub_body(f"error {hidden} end", [PAT_LIKE])
+
+    assert PAT_LIKE not in result
+    assert "<redacted>" in result

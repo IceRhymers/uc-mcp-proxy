@@ -368,6 +368,12 @@ def _build_http_client(
         timeout=httpx.Timeout(30.0, read=300.0),
         auth=auth,
         transport=transport,
+        # Compression is refused, not merely unused. The read caps that bound
+        # diagnostic snippets count *decoded* bytes, and httpx decompresses
+        # before yielding, so one gzip chunk can expand ~1000x past the cap
+        # before anything gets to check it. Neither a diagnostic body nor an
+        # SSE stream gains anything from compression.
+        headers={"Accept-Encoding": "identity"},
         event_hooks={
             "request": [stamp_role, guard_forwarded_token],
             "response": [reporter.on_response],

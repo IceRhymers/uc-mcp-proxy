@@ -167,7 +167,16 @@ def exchange_pat(
             # Streamed so the body can be bounded. A token endpoint's reply is a
             # few hundred bytes; anything larger is a misconfiguration or
             # hostile, and this call is holding the event loop while it reads.
-            with client.stream("POST", endpoint, data=form, headers={"Authorization": f"Bearer {pat}"}) as response:
+            with client.stream(
+                "POST",
+                endpoint,
+                data=form,
+                # ``identity``: the byte cap in ``_read_bounded`` counts decoded
+                # bytes and httpx decompresses before yielding, so a compressed
+                # reply could blow past it by three orders of magnitude in a
+                # single chunk -- on the event-loop thread.
+                headers={"Authorization": f"Bearer {pat}", "Accept-Encoding": "identity"},
+            ) as response:
                 status = response.status_code
                 reason = scrub_reason(response.reason_phrase or "", [pat])
                 body = _read_bounded(response, deadline)

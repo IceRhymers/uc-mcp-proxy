@@ -95,9 +95,12 @@ _REDACTED = "<redacted>"
 _MAX_SNIPPET_BYTES = 64 * 1024
 
 #: Above this, a secret is matched literally rather than as an interleaved
-#: pattern. Building one is linear in the needle's length, and a server picks
-#: the length of ``mcp-session-id``.
-_MAX_PATTERN_CHARS = 256
+#: pattern. A server picks the length of ``mcp-session-id``, so the cost has to
+#: be bounded somewhere -- but the bound sits far above any credential this
+#: proxy handles. An OIDC JWT runs several hundred characters (an RS256
+#: signature alone is 342 base64url characters), and a token that fell through
+#: to exact matching would lose separator tolerance entirely.
+_MAX_PATTERN_CHARS = 4096
 
 #: Shortest surviving fragment of a severed secret still worth redacting.
 #: Below this the fragment carries little and false positives would start
@@ -129,9 +132,23 @@ def _control_chars() -> dict[int, None]:
     on a path that is already about to print a diagnosis.
     """
     return dict.fromkeys(
-        cp
-        for cp in range(sys.maxunicode + 1)
-        if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+        [
+            *(
+                cp
+                for cp in range(sys.maxunicode + 1)
+                if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+            ),
+            # Blank in every terminal but not ``Cf``, so the category test above
+            # misses them: the Hangul fillers are ``Lo`` and the braille blank
+            # is ``So``. Categories close most of the class; these are the
+            # documented residue. ``scrub_body`` states the honest limit -- this
+            # is defence in depth, not a guarantee.
+            0x115F,  # HANGUL CHOSEONG FILLER
+            0x1160,  # HANGUL JUNGSEONG FILLER
+            0x3164,  # HANGUL FILLER
+            0xFFA0,  # HALFWIDTH HANGUL FILLER
+            0x2800,  # BRAILLE PATTERN BLANK
+        ]
     )
 
 
@@ -259,60 +276,93 @@ def scrub_body(text: str, secrets: Sequence[str]) -> str:
     never half-printed, only requires redaction to precede *truncation*, which
     it still does.
 
-    A separator that survives normalization -- a run of whitespace collapses to
-    a single space rather than vanishing -- would still hide the secret from
-    exact matching, so a separator-tolerant pass follows.
-
     Secret-agnostic so the token-exchange path, whose request carries a
     credential in the body as well as the header, shares this one
     implementation of the terminal-escape defense rather than growing a second.
+
+    This is defence in depth against a server that echoes back what it was
+    sent, and it is bounded by what a *cooperative* mistake looks like. It is
+    not a guarantee against a hostile server: anything able to echo a
+    credential already holds that credential, and could simply keep it. The
+    controls that actually contain a credential are the ones that stop it being
+    sent -- the ``pat`` carve-out on ``X-Forwarded-Access-Token``, the
+    cross-origin guard, and the HTTPS floor on the token endpoint.
     """
-    # Strip first, collapse LAST. The reverse order looks equivalent and is not:
-    # deleting control characters after the collapse re-creates whitespace runs
-    # the collapse had already flattened (``"A \x00 \x00 B"`` -> ``"A   B"``),
-    # and the regex below is only safe because no such run can exist.
-    scrubbed = _normalize(text)
-    # Longest first, so a secret that is a prefix of another cannot redact the
-    # short one and leave the longer one's tail exposed.
-    ordered = sorted(secrets, key=len, reverse=True)
-    for secret in ordered:
-        # Normalized the same way the haystack was, so a credential carrying a
-        # control character matches the text after that character is stripped.
+    return _redact(_normalize(text), secrets)[:_BODY_SNIPPET_LIMIT]
+
+
+def _redact(text: str, secrets: Sequence[str]) -> str:
+    """Replace every occurrence of every secret in ``text``.
+
+    Every span is located against the text as passed in, and the splice happens
+    once at the end. Redacting secrets one after another instead -- each one
+    searching the string the previous one already rewrote -- is not merely
+    untidy: ``mcp-session-id`` is chosen by the server and bounded by nothing,
+    so a server can craft one that overlaps the real credential by a single
+    character, have it replaced first, and destroy the real credential's own
+    match. Order-independence is the property that closes that, and applying
+    the longest secret first is not a substitute for it.
+    """
+    spans: list[tuple[int, int]] = []
+    for secret in secrets:
         needle = _normalize(secret)
         if not needle:
             continue
-        if " " in needle or len(needle) > _MAX_PATTERN_CHARS:
-            # Exact match only. An interleaved pattern built from a needle that
-            # itself contains whitespace is ambiguous at every space, and one
-            # built from a very long needle is linear in its length -- and
-            # ``mcp-session-id`` is a server-chosen secret with no validation
-            # anywhere in the SDK, so both are attacker-reachable.
-            scrubbed = scrubbed.replace(needle, _REDACTED)
-            continue
-        # ``\s?``, not ``\s*``: the collapse ran last, so the haystack holds no
-        # whitespace run longer than one, and the needle holds none at all.
-        # Each group therefore has a single admissible match and cannot
-        # backtrack combinatorially.
-        scrubbed = re.sub(r"\s?".join(map(re.escape, needle)), _REDACTED, scrubbed)
+        spans.extend(_spans_for(text, needle))
+    if not spans:
+        return text
 
-    # A secret can also be severed *before* this function is reached: the
-    # callers stop reading at a byte cap, and that cap can land in the middle
-    # of a credential. What survives is a prefix at the very end of the text,
-    # which matches nothing above -- and if the discarded remainder was mostly
-    # control characters, the prefix sits well inside the visible window rather
-    # than being cut away by the truncation below. Reading further is not a fix
-    # (the next cap has the same edge), so the trailing edge is swept here.
-    for secret in ordered:
-        needle = _normalize(secret)
-        for length in range(len(needle) - 1, _MIN_PARTIAL_SECRET - 1, -1):
-            if scrubbed.endswith(needle[:length]):
-                scrubbed = scrubbed[:-length] + _REDACTED
-                break
-    # Truncation happens last and nothing truncates before it. Any earlier cut
-    # -- including a "just to bound the work" one -- can sever a secret and let
-    # the surviving half through, which is the whole hazard this ordering
-    # exists to prevent. Callers bound the *read* instead.
-    return scrubbed[:_BODY_SNIPPET_LIMIT]
+    out: list[str] = []
+    last = 0
+    for lo, hi in _merged(spans):
+        out.append(text[last:lo])
+        out.append(_REDACTED)
+        last = hi
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _spans_for(text: str, needle: str) -> list[tuple[int, int]]:
+    """Where ``needle`` occurs in ``text``, tolerating an inserted separator."""
+    if " " in needle or len(needle) > _MAX_PATTERN_CHARS:
+        # An interleaved pattern built from a needle that itself contains
+        # whitespace is ambiguous at every space, and one built from an
+        # enormous needle costs time the server would be choosing. Both are
+        # only reachable via ``mcp-session-id``, which no real credential
+        # resembles, so exact matching is the right trade there -- and the cap
+        # sits well above any token this proxy handles, because an OIDC JWT is
+        # several hundred characters and must NOT fall through to it.
+        found = []
+        at = text.find(needle)
+        while at != -1:
+            found.append((at, at + len(needle)))
+            at = text.find(needle, at + 1)
+        matches = found
+    else:
+        # ``\s?``: the collapse in ``_normalize`` ran last, so no whitespace run
+        # longer than one survives, and the needle holds none at all.
+        pattern = re.compile(r"\s?".join(map(re.escape, needle)))
+        matches = [match.span() for match in pattern.finditer(text)]
+
+    # The callers stop reading at a byte cap that can land inside a credential.
+    # What survives is a prefix at the very end, matching nothing above. Reading
+    # further is not a fix -- the next cap has the same edge.
+    for length in range(len(needle) - 1, _MIN_PARTIAL_SECRET - 1, -1):
+        if text.endswith(needle[:length]):
+            matches.append((len(text) - length, len(text)))
+            break
+    return matches
+
+
+def _merged(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Overlapping spans coalesced, so one redaction cannot split another."""
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
 
 
 def scrub_reason(reason: str, secrets: Sequence[str] = ()) -> str:
