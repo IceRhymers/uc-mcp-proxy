@@ -28,6 +28,7 @@ credential is re-derived from the PAT when it expires.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -163,6 +164,11 @@ def exchange_pat(
             verify=config.verify_ssl,
             timeout=config.timeout,
             transport=transport,
+            # Explicit because it is load-bearing, not because it is not the
+            # default: a 307 would re-send the PAT -- which is in the request
+            # *body* here -- to whatever host the redirect names, with
+            # ``Authorization`` stripped cross-origin. Never turn this on.
+            follow_redirects=False,
         ) as client:
             # Streamed so the body can be bounded. A token endpoint's reply is a
             # few hundred bytes; anything larger is a misconfiguration or
@@ -259,7 +265,14 @@ def _read_bounded(response: httpx.Response, deadline: float) -> str:
     for chunk in response.iter_bytes():
         chunks.append(chunk)
         size += len(chunk)
-        if size >= _MAX_RESPONSE_BYTES or time.monotonic() > deadline:
+        # ``num_bytes_downloaded`` is the wire count: a server may compress
+        # despite ``Accept-Encoding: identity``, and httpx decodes on the
+        # response header, so the decoded size alone does not bound one chunk.
+        if (
+            size >= _MAX_RESPONSE_BYTES
+            or response.num_bytes_downloaded >= _MAX_RESPONSE_BYTES
+            or time.monotonic() > deadline
+        ):
             break
     # No slice: the loop already bounded this, and a cut here would sever a
     # straddling secret before ``scrub_body`` ever sees it.
@@ -272,11 +285,22 @@ def _token_endpoint(host: str) -> str:
 
 
 def _expires_in(payload: dict[str, object]) -> float:
-    """The token's stated lifetime in seconds, defaulting when absent or odd."""
+    """The token's stated lifetime in seconds, defaulting when absent or odd.
+
+    Clamped, because the value is whatever the endpoint said. ``nan``/``inf``
+    would make the cached token never expire; zero or negative would make it
+    expire on arrival, and since the exchange is synchronous on the event-loop
+    thread that means one blocking round trip *per request* rather than one per
+    hour. The retry still covers a token that dies early, so a floor here costs
+    nothing but removes both pathologies.
+    """
     try:
-        return float(payload.get("expires_in", _DEFAULT_EXPIRES_IN))  # type: ignore[arg-type]
+        seconds = float(payload.get("expires_in", _DEFAULT_EXPIRES_IN))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return float(_DEFAULT_EXPIRES_IN)
+    if not math.isfinite(seconds) or seconds <= 0:
+        return float(_DEFAULT_EXPIRES_IN)
+    return seconds
 
 
 def _format_failure(

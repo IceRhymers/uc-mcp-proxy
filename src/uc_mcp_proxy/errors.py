@@ -529,7 +529,11 @@ class HttpErrorReporter:
             async for chunk in response.aiter_bytes():
                 chunks.append(chunk)
                 size += len(chunk)
-                if size >= _MAX_SNIPPET_BYTES:
+                # Both the decoded size and the wire size. ``Accept-Encoding:
+                # identity`` is a request; a server may compress anyway, and
+                # httpx decodes on the *response's* header regardless of what
+                # was asked, so one chunk can decode far past the cap.
+                if size >= _MAX_SNIPPET_BYTES or response.num_bytes_downloaded >= _MAX_SNIPPET_BYTES:
                     break
             read_ok = True
         if not read_ok:

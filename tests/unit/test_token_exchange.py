@@ -555,3 +555,55 @@ def test_malformed_host_is_diagnosed_not_raised():
 
     assert PAT not in str(excinfo.value)
     assert "not a usable URL" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "expires_in",
+    ["nan", "inf", "-inf", 0, -1, -3600],
+    ids=["nan", "inf", "neg_inf", "zero", "minus_one", "very_negative"],
+)
+def test_a_degenerate_lifetime_falls_back_to_the_default(expires_in):
+    """A lifetime the endpoint made up must not break the cache in either direction.
+
+    ``nan``/``inf`` make the cached token never expire; zero or negative make it
+    expire on arrival, and since the exchange is synchronous on the event-loop
+    thread that turns one blocking round trip per hour into one per request.
+    """
+    import math
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"access_token": "t", "expires_in": expires_in})
+
+    token = exchange_pat(PAT, make_config(), now=lambda: 1000.0, transport=httpx.MockTransport(handler))
+
+    assert math.isfinite(token.expires_at)
+    assert token.expires_at == 1000.0 + 3600 - 60
+
+
+def test_a_plausible_short_lifetime_is_still_honoured():
+    """The clamp must catch only the degenerate values, not a genuinely short token."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"access_token": "t", "expires_in": 300})
+
+    token = exchange_pat(PAT, make_config(), now=lambda: 1000.0, transport=httpx.MockTransport(handler))
+
+    assert token.expires_at == 1000.0 + 300 - 60
+
+
+def test_the_exchange_client_never_follows_a_redirect():
+    """A 307 would re-send the PAT -- which is in the request body -- elsewhere.
+
+    Cross-origin, httpx strips ``Authorization`` but the body travels intact, so
+    following one would hand the credential to whatever host the redirect names.
+    """
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(307, headers={"location": "https://evil.example.com/steal"})
+
+    with pytest.raises(TokenExchangeError):
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    assert hosts == ["test-workspace.cloud.databricks.com"], f"the PAT was re-sent to {hosts}"

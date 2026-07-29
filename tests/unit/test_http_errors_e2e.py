@@ -909,9 +909,12 @@ async def test_teardown_exchange_failure_is_silent_and_exits_zero(monkeypatch, m
 
     def exchange_responder(request: httpx.Request) -> httpx.Response:
         if next(attempts) == 1:
-            # expires_in below the renewal margin, so the cache is stale the
-            # moment it is written and teardown is forced to re-mint.
-            return httpx.Response(200, json={"access_token": "app-token-1", "expires_in": 0})
+            # A positive lifetime below the 60s renewal margin, so the cache is
+            # stale the moment it is written and teardown is forced to re-mint.
+            # Not ``0``: that is clamped to the default, because a zero or
+            # negative lifetime would otherwise cost one blocking exchange per
+            # request rather than one per hour.
+            return httpx.Response(200, json={"access_token": "app-token-1", "expires_in": 1})
         return httpx.Response(400, json={"error": "workspace unreachable"})
 
     exchange = _ExchangeTransport(exchange_responder)

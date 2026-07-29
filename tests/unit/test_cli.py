@@ -603,3 +603,42 @@ def test_parse_scopes_dedupes_exact_duplicates():
     from uc_mcp_proxy.__main__ import _parse_scopes
 
     assert _parse_scopes(["a", "a"]) == ("a",)
+
+
+def test_proxy_client_refuses_compressed_responses(mock_workspace_client):
+    """Diagnostic reads are capped in bytes, and compression defeats a byte cap.
+
+    httpx decodes on the response's ``Content-Encoding`` before yielding, so a
+    gzip body can expand three orders of magnitude past the cap inside a single
+    chunk. Neither an error body nor an SSE stream gains anything from being
+    compressed. Asserted because a future ``headers=`` argument here would
+    silently drop it.
+    """
+    from uc_mcp_proxy.__main__ import _build_http_client
+    from uc_mcp_proxy.errors import HttpErrorReporter
+
+    reporter = HttpErrorReporter(url="https://example.com/mcp", profile="p", auth_type="pat")
+    client = _build_http_client(auth=MagicMock(), verify_ssl=True, reporter=reporter)
+
+    assert client.headers["accept-encoding"] == "identity"
+
+
+def test_exchange_client_refuses_compressed_responses():
+    """Same bound on the token-exchange client, which reads on the event loop."""
+    import httpx as _httpx
+
+    from uc_mcp_proxy.token_exchange import ExchangeConfig, exchange_pat
+
+    seen: list[str] = []
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        seen.append(request.headers.get("accept-encoding", ""))
+        return _httpx.Response(200, json={"access_token": "t"})
+
+    exchange_pat(
+        "dapi-fake",
+        ExchangeConfig(host="https://w.cloud.databricks.com", client_id="c", scopes=(), verify_ssl=True),
+        transport=_httpx.MockTransport(handler),
+    )
+
+    assert seen == ["identity"]
