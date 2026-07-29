@@ -22,8 +22,10 @@ request was for. ``stamp_role`` records the role on the way out instead.
 from __future__ import annotations
 
 import contextlib
+import functools
 import re
 import sys
+import unicodedata
 from collections.abc import Sequence
 
 import anyio
@@ -83,37 +85,37 @@ _METHOD_ROLES = {
 # inside a server error body.
 _SECRET_HEADERS = ("X-Forwarded-Access-Token", "mcp-session-id")
 
-#: Characters deleted from every piece of remote-controlled text the proxy
-#: prints -- the body snippet *and* the status line's reason phrase, which is
-#: just as server-authored and reaches h11 intact (its grammar rejects only NUL
-#: and whitespace, so ESC passes). Collapsing whitespace does not remove ESC, so
-#: without this a server could emit cursor-movement and erase sequences that
-#: overwrite the diagnosis above it with text of its own choosing.
-#:
-#: C0, DEL, and C1 cover that. The bidi overrides and zero-width characters
-#: cannot move the cursor, but they can reorder how the one server-controlled
-#: line renders -- enough to detach a ``<redacted>`` marker from what it
-#: redacts, or print a hostname backwards.
-_CONTROL_CHARS = dict.fromkeys(
-    [
-        *range(0x00, 0x20),
-        0x7F,
-        *range(0x80, 0xA0),
-        *range(0x200B, 0x2010),  # zero-width space .. zero-width joiners
-        *range(0x202A, 0x202F),  # bidi embeddings and overrides
-        *range(0x2066, 0x206A),  # bidi isolates
-        0xFEFF,  # zero-width no-break space
-    ]
-)
-
-#: What a redacted secret is replaced with. Named so the two passes in
-#: ``scrub_body`` cannot drift apart.
+#: What a redacted secret is replaced with.
 _REDACTED = "<redacted>"
 
-#: Redaction is bounded to this many characters before the separator-tolerant
-#: pass runs, which is linear in the secret's length. The visible window is only
-#: ``_BODY_SNIPPET_LIMIT``, so anything past this can never reach the terminal.
-_PRESCAN_LIMIT = 8192
+#: Cap on how much of a remote body is buffered before it is scrubbed. The
+#: snippet the user sees is only ``_BODY_SNIPPET_LIMIT``; this bounds what the
+#: proxy holds in memory to get there, so a server cannot make it buffer
+#: gigabytes to produce a few hundred characters.
+_MAX_SNIPPET_BYTES = 64 * 1024
+
+
+@functools.lru_cache(maxsize=1)
+def _control_chars() -> dict[int, None]:
+    """Every character deleted from remote-controlled text before it is printed.
+
+    Derived from Unicode categories rather than enumerated by hand. An
+    enumerated list was wrong twice: it is not enough to strip the escapes that
+    move a cursor (``Cc``), because the invisible formatting characters
+    (``Cf`` -- soft hyphen, word joiner, the bidi controls, the tag block) let a
+    server sit one of them between every character of a credential. That
+    defeats an exact-match redactor while still *rendering* as the bare secret
+    to anyone reading the log. Categories close the class; a list closes
+    whichever members somebody thought of.
+
+    Whitespace is deliberately not excluded: this runs after the collapse, so
+    the only whitespace left is the single space the collapse produced, and
+    ``U+0020`` is ``Zs`` rather than ``Cc``.
+
+    Built lazily and cached -- the scan is ~100ms, and it is only ever needed
+    on a path that is already about to print a diagnosis.
+    """
+    return dict.fromkeys(cp for cp in range(sys.maxunicode + 1) if unicodedata.category(chr(cp)) in ("Cc", "Cf"))
 
 
 async def stamp_role(request: httpx.Request) -> None:
@@ -138,7 +140,7 @@ async def stamp_role(request: httpx.Request) -> None:
 
 
 async def guard_forwarded_token(request: httpx.Request) -> None:
-    """Drop ``X-Forwarded-Access-Token`` on any hop that leaves the first origin.
+    """Drop credential headers on any hop that leaves the first origin.
 
     httpx pops ``Authorization`` when a redirect crosses origins but knows
     nothing about this header, so without this a single ``302`` hands a live
@@ -155,10 +157,23 @@ async def guard_forwarded_token(request: httpx.Request) -> None:
     flow runs once per attempt while redirects are rebuilt beneath it -- only a
     hook sees every hop.
     """
+    # Two properties at once, and the structure is what gets both.
+    #
+    # Never raises: a request hook is invoked outside httpx's own ``try``, so
+    # an exception here escapes without even closing the response.
+    #
+    # Fails *closed*: the headers come off first and go back on only once the
+    # origin has been confirmed to match, so anything unexpected in between
+    # leaves them off. A blanket suppress is right for ``stamp_role``, where
+    # failing open merely loses a label; here failing open would hand a live
+    # credential to a foreign origin.
     with contextlib.suppress(Exception):
+        carried = {name: request.headers.pop(name) for name in _SECRET_HEADERS if name in request.headers}
+        if not carried:
+            return
         origin = (request.url.scheme, request.url.host, request.url.port)
-        if request.extensions.setdefault(_ORIGIN_KEY, origin) != origin:
-            request.headers.pop("X-Forwarded-Access-Token", None)
+        if request.extensions.setdefault(_ORIGIN_KEY, origin) == origin:
+            request.headers.update(carried)
 
 
 def arm_retry(request: httpx.Request, *, armed: bool) -> None:
@@ -221,18 +236,23 @@ def scrub_body(text: str, secrets: Sequence[str]) -> str:
     credential in the body as well as the header, shares this one
     implementation of the terminal-escape defense rather than growing a second.
     """
-    scrubbed = " ".join(text.split())[:_PRESCAN_LIMIT].translate(_CONTROL_CHARS)
+    scrubbed = " ".join(text.split()).translate(_control_chars())
     for secret in secrets:
         if not secret:
             continue
-        scrubbed = scrubbed.replace(secret, _REDACTED)
-        # Anchored on the secret's own characters, so it cannot backtrack.
+        # One pass, tolerant of the single space a collapsed whitespace run
+        # leaves behind. Anchored on the secret's own characters and facing a
+        # haystack with no multi-character whitespace run, so each ``\s*`` can
+        # match at most one character and it cannot backtrack.
         scrubbed = re.sub(r"\s*".join(map(re.escape, secret)), _REDACTED, scrubbed)
-    # Truncated last, so the limit counts characters the user actually sees.
+    # Truncation happens last and nothing truncates before it. Any earlier cut
+    # -- including a "just to bound the work" one -- can sever a secret and let
+    # the surviving half through, which is the whole hazard this ordering
+    # exists to prevent. Callers bound the *read* instead.
     return scrubbed[:_BODY_SNIPPET_LIMIT]
 
 
-def scrub_reason(reason: str) -> str:
+def scrub_reason(reason: str, secrets: Sequence[str] = ()) -> str:
     """Return an HTTP reason phrase safe to interpolate into a diagnosis.
 
     The reason phrase is as server-authored as the body and reaches us intact:
@@ -241,8 +261,14 @@ def scrub_reason(reason: str) -> str:
     interpolates it, so without this the escape defense built for the body
     snippet is simply walked around -- and unlike the body, the status line is
     bounded only by h11's 16 KiB header limit.
+
+    ``secrets`` is not optional in spirit. Stripping escapes without redacting
+    leaves a channel that prints a credential *in full*, on the line directly
+    above a body the same function successfully protected: a server answering
+    ``403 Forbidden token=<the token it just received>`` needs no positioning
+    and no padding to do it.
     """
-    return scrub_body(reason, [])[:_REASON_LIMIT]
+    return scrub_body(reason, secrets)[:_REASON_LIMIT]
 
 
 class HttpErrorReporter:
@@ -380,16 +406,22 @@ class HttpErrorReporter:
         consumed but not closed and ``.text`` raises ``ResponseNotRead``, so
         the flag -- not a try around ``.text`` alone -- is what makes this safe.
         """
+        chunks: list[bytes] = []
         read_ok = False
         with anyio.move_on_after(_BODY_READ_TIMEOUT):
-            await response.aread()
+            # Bounded, not ``aread()``. The timeout alone caps how *long* a
+            # server can talk, which on a fast link is still hundreds of
+            # megabytes buffered to produce a few hundred printed characters.
+            size = 0
+            async for chunk in response.aiter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= _MAX_SNIPPET_BYTES:
+                    break
             read_ok = True
         if not read_ok:
             return ""
-        try:
-            text = response.text
-        except Exception:  # pragma: no cover - guarded by read_ok
-            return ""
+        text = b"".join(chunks)[:_MAX_SNIPPET_BYTES].decode("utf-8", errors="replace")
         return scrub_body(text, self._secrets(response.request))
 
     def _secrets(self, request: httpx.Request) -> list[str]:
@@ -424,7 +456,7 @@ class HttpErrorReporter:
         failure as a local-credential failure.
         """
         status = response.status_code
-        reason = scrub_reason(response.reason_phrase or "")
+        reason = scrub_reason(response.reason_phrase or "", self._secrets(response.request))
         # Proxy-authored, never server-authored, so it needs no scrubbing. Only
         # the remediation is substituted; the headline stays as written, which
         # is what keeps this module from having to know what the proxy did to
@@ -508,7 +540,7 @@ def _leaves(exc: BaseException) -> list[BaseException]:
 def is_only_diagnosed_errors(exc: BaseException) -> bool:
     """True if every leaf of ``exc`` has already been diagnosed to stderr.
 
-    Generalizes ``is_only_http_status_errors`` to the second failure shape: a
+    Generalizes the swallow decision to the second failure shape: a
     ``ProxyFatalError`` the proxy raised *after* reporting it. Keeps the same
     positive, non-empty match, so a bare ``CancelledError`` still answers False
     and Ctrl-C is never reported as a credential rejection.

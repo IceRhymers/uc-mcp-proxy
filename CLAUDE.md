@@ -102,23 +102,46 @@ only the response hook can populate the latter.
 the intuitive one. Collapsing and the control strip both *delete* characters, so
 redacting first lets a server hide a credential from `str.replace` by echoing it
 with one byte inserted — and then the strip removes that byte and reassembles
-the secret verbatim on its way to stderr. Redaction only has to precede
-*truncation*, which it still does. A separator-tolerant pass follows, because a
-run of whitespace collapses to a single space rather than vanishing.
+the secret verbatim on its way to stderr. A separator-tolerant pass follows,
+because a run of whitespace collapses to a single space rather than vanishing.
 
-Two things are easy to miss here:
+**Nothing may truncate before redaction — including a bound added "just to
+limit the work".** An earlier version capped the redaction window at 8 KiB and
+so severed any secret straddling it, printing the half that survived. Callers
+bound the *read* instead (`_MAX_SNIPPET_BYTES`, `_MAX_RESPONSE_BYTES`), which
+limits memory without ever cutting a secret in two.
+
+The stripped character set is derived from Unicode categories (`Cc` + `Cf`), not
+enumerated. An enumerated list was wrong twice: stripping the escapes that move
+a cursor is not enough, because the *invisible* formatting characters — soft
+hyphen, word joiner, the bidi controls, the tag block — let a server sit one
+between every character of a credential, defeating an exact-match redactor while
+still rendering as the bare secret to whoever reads the log.
+
+Three more things are easy to miss:
+
+- **The reason phrase needs the secret list, not just the escape strip.** It is
+  server-authored, it is interpolated into every headline, and a server that
+  answers `403 Forbidden token=<what it just received>` needs no padding and no
+  positioning to print a credential in full on the line directly above a body
+  that was correctly redacted.
 
 - **The body snippet is not the only remote-controlled text.** The status line's
   reason phrase is equally server-authored — h11's grammar rejects only NUL and
   whitespace, so ESC survives — and it is interpolated into every headline.
   `scrub_reason` exists so the escape defense cannot simply be walked around.
-- **`X-Forwarded-Access-Token` outlives its origin unless something stops it.**
+- **Credential headers outlive their origin unless something stops them.**
   httpx pops `Authorization` on a cross-origin redirect but knows nothing about
-  our header, so a single 302 would hand a live credential to a foreign host
-  *with the real credential already stripped*. `guard_forwarded_token` is a
-  request hook rather than a check in `_apply_headers` because the auth flow runs
-  once per attempt while redirects are rebuilt beneath it — only a hook sees
-  every hop.
+  `X-Forwarded-Access-Token` or `mcp-session-id`, so a single 302 would hand a
+  live credential to a foreign host *with the real credential already stripped*.
+  `guard_forwarded_token` is a request hook rather than a check in
+  `_apply_headers` because the auth flow runs once per attempt while redirects
+  are rebuilt beneath it — only a hook sees every hop.
+- **That guard fails closed; `stamp_role` fails open.** Both are wrapped in a
+  blanket `suppress`, because neither may raise. But the guard pops the headers
+  *first* and puts them back only once the origin is confirmed, so a failure
+  mid-check leaves them off. Failing open loses a label in one case and leaks a
+  credential in the other.
 
 ## Testing
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import sys
 import time
 from collections.abc import AsyncIterator
 
@@ -30,6 +31,13 @@ if _BaseExceptionGroup is None:  # pragma: no cover - version-dependent
 URL = "https://example.com/mcp"
 PROFILE = "test-profile"
 AUTH_TYPE = "oauth-u2m"
+
+
+def await_sync(coro):
+    """Drive a coroutine to completion from a sync test."""
+    import asyncio
+
+    return asyncio.run(coro)
 
 
 def make_reporter():
@@ -957,3 +965,209 @@ async def test_guard_never_raises_on_a_malformed_request():
         url = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
 
     await guard_forwarded_token(_Exploding())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 27: nothing may truncate before redaction, at any internal boundary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset", [-2, -1, 0, 1, 2], ids=lambda n: f"straddle{n:+d}")
+def test_no_internal_boundary_can_sever_a_secret(offset):
+    """A secret is redacted wherever it falls, however long the body is.
+
+    An earlier version bounded the redaction window to the first 8 KiB *before*
+    stripping control characters. Because stripping deletes, content past that
+    cut shifted left into the visible window while the cut itself had already
+    severed the secret -- printing half a credential. There is now no truncation
+    before redaction anywhere; this pins that for a body far larger than any
+    such window.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    # Control padding is deleted, so the visible text stays inside the snippet
+    # limit while the raw string is long enough to cross any internal bound.
+    padding = "\x01" * 8000 + "A" * (192 + offset)
+    result = scrub_body(padding + secret + " tail", [secret])
+
+    longest = max((n for n in range(len(secret), 3, -1) if secret[:n] in result), default=0)
+    assert longest == 0, f"leaked a {longest}-character prefix: {result[-60:]!r}"
+    assert "<redacted>" in result
+
+
+def test_snippet_read_is_bounded(monkeypatch):
+    """A huge error body is not buffered whole to produce a 500-char snippet.
+
+    The 5-second read timeout caps how *long* a server may talk, which on a
+    fast link is still hundreds of megabytes.
+    """
+    from uc_mcp_proxy import errors
+
+    monkeypatch.setattr(errors, "_MAX_SNIPPET_BYTES", 64)
+    delivered: list[int] = []
+
+    class _Chunked(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(1000):
+                delivered.append(1)
+                yield b"B" * 32
+
+    reporter = make_reporter()
+    response = make_response(500, stream=_Chunked())
+
+    snippet = await_sync(reporter._read_snippet(response))
+
+    assert len(snippet) <= 64
+    assert len(delivered) <= 3, f"read {len(delivered)} chunks; the cap did not stop it"
+
+
+# ---------------------------------------------------------------------------
+# 28: invisible characters must not be able to hide a credential
+# ---------------------------------------------------------------------------
+
+
+def _invisible_separators():
+    """Every non-whitespace Cc/Cf codepoint, sampled across the ranges.
+
+    Generated from Unicode categories rather than listed. A hand-written list
+    was wrong twice, and each time the fix was to add the members someone had
+    just thought of.
+    """
+    import unicodedata
+
+    found = [
+        cp
+        for cp in range(sys.maxunicode + 1)
+        if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+    ]
+    return found[::37]  # a spread across every range, not just the low ones
+
+
+@pytest.mark.parametrize("codepoint", _invisible_separators(), ids=lambda cp: f"U+{cp:04X}")
+def test_invisible_characters_cannot_hide_a_secret(codepoint):
+    """A credential interleaved with invisible characters is still redacted.
+
+    These render as nothing, so a log reader sees the bare credential while an
+    exact-match redactor -- and a secret scanner grepping the file -- sees
+    something that does not match.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    hidden = chr(codepoint).join(secret)
+
+    result = scrub_body(f"error {hidden} end", [secret])
+
+    assert secret not in result
+    assert chr(codepoint) not in result
+    assert "<redacted>" in result
+
+
+# ---------------------------------------------------------------------------
+# 29: the reason phrase is a credential channel, not just an escape channel
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_reason_redacts_secrets_not_only_escapes():
+    """Stripping escapes without redacting leaves a full-disclosure channel."""
+    from uc_mcp_proxy.errors import scrub_reason
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+
+    result = scrub_reason(f"Forbidden token={secret}", [secret])
+
+    assert secret not in result
+    assert "<redacted>" in result
+
+
+@pytest.mark.anyio
+async def test_headline_never_carries_a_credential_from_the_reason_phrase(capsys):
+    """End to end: the status line cannot print what the body line redacts.
+
+    A server needs no padding and no positioning for this -- it echoes the
+    credential it was just sent, in the one field that was not being scrubbed,
+    and it lands on the line directly above a correctly-redacted body.
+    """
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    token = "dapiDEADBEEF0123456789abcdef"
+    reporter = make_reporter()
+    request = httpx.Request(
+        "POST", URL, headers={"Authorization": f"Bearer {token}"}, extensions={_ROLE_KEY: "request"}
+    )
+    response = httpx.Response(403, request=request, text="{}")
+    response.extensions = dict(response.extensions, reason_phrase=f"Forbidden token={token}".encode())
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert token not in err, "the credential reached stderr via the status line"
+    assert "403" in err
+
+
+# ---------------------------------------------------------------------------
+# 30: the redirect guard covers every header this module calls a secret
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_guard_drops_the_session_id_cross_origin():
+    """``mcp-session-id`` is declared a secret here, so it must not travel either.
+
+    Unlike the forwarded token, this one discloses to a party that never held
+    it: httpx strips ``Authorization`` on the hop, so the foreign origin would
+    otherwise receive a live session id and nothing else to explain it.
+    """
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    redirected = httpx.Request(
+        "GET",
+        "https://elsewhere.example.net/x",
+        headers={"mcp-session-id": "SESSION-SECRET", "X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(redirected)
+
+    assert "mcp-session-id" not in redirected.headers
+    assert "X-Forwarded-Access-Token" not in redirected.headers
+
+
+@pytest.mark.anyio
+async def test_guard_drops_credentials_on_a_scheme_downgrade():
+    """Same host over plain http is a different origin, and the riskier one."""
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    downgraded = httpx.Request(
+        "GET",
+        "http://example.com/mcp",
+        headers={"X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(downgraded)
+
+    assert "X-Forwarded-Access-Token" not in downgraded.headers
+
+
+@pytest.mark.anyio
+async def test_guard_fails_closed_when_the_origin_cannot_be_determined():
+    """If anything goes wrong mid-check the credentials stay off, not on.
+
+    Failing open here would hand a credential to a foreign origin, which is the
+    opposite default from ``stamp_role``, where a failure merely loses a label.
+    """
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    class _BadUrl(httpx.Request):
+        @property
+        def url(self):
+            raise RuntimeError("boom")
+
+    request = httpx.Request("GET", URL, headers={"X-Forwarded-Access-Token": "tok"})
+    # Swapped after construction: httpx assigns ``self.url`` in ``__init__``,
+    # and a property is a data descriptor, so it wins over the instance dict.
+    request.__class__ = _BadUrl
+
+    await guard_forwarded_token(request)  # must not raise
+
+    assert "X-Forwarded-Access-Token" not in request.headers

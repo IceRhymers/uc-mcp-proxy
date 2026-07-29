@@ -600,10 +600,10 @@ async def test_response_hook_precedes_auth_flow():
     reaches the first 401 first and aborts the process before the retry can ever
     be dispatched, so the retry would be present, correct, and dead.
 
-    It is an httpx *internal*, not a documented contract, and ``pyproject.toml``
-    pins httpx with no upper bound -- so this test, not a version bound, is what
-    turns a future reordering into a loud CI failure instead of a feature that
-    silently stops retrying.
+    It is an httpx *internal*, not a documented contract. ``pyproject.toml``
+    caps httpx below the next minor precisely because of it; this test is the
+    gate for raising that cap. A reordering then shows up as a loud CI failure
+    rather than a feature that silently stops retrying.
     """
     order: list[str] = []
 
@@ -1167,7 +1167,7 @@ def test_proxy_process_exits_on_401_with_stdin_still_open():
 async def test_unrelated_exception_is_not_swallowed_by_the_backstop(monkeypatch, mock_workspace_client, capsys):
     """``except BaseException`` is the riskiest construct here -- pin the re-raise.
 
-    ``is_only_http_status_errors`` is tested exhaustively as a predicate, but
+    ``is_only_diagnosed_errors`` is tested exhaustively as a predicate, but
     nothing otherwise exercises the wiring that keeps a genuine bug (or a
     Ctrl-C) from being swallowed and misreported as a credential rejection.
     """

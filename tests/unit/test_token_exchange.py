@@ -440,24 +440,56 @@ def test_https_host_is_accepted():
 # ---------------------------------------------------------------------------
 
 
-def test_oversized_response_body_is_bounded():
-    """A huge reply cannot be buffered without limit while the loop is blocked.
+def test_oversized_response_body_is_bounded(monkeypatch):
+    """The reader stops at the cap instead of buffering the whole reply.
 
-    A token endpoint's real reply is a few hundred bytes. This call is
-    synchronous and runs on the event-loop thread, so an unbounded read would
-    hold the stdio bridge open for as long as the server cares to talk.
+    Asserted by shrinking the cap below ``scrub_body``'s own 500-character
+    limit. Left at 64 KiB the assertion would be satisfied by that limit alone
+    and would pass against a completely unbounded read -- which is exactly what
+    an earlier version of this test did.
     """
-    from uc_mcp_proxy.token_exchange import _MAX_RESPONSE_BYTES
+    from uc_mcp_proxy import token_exchange
+
+    monkeypatch.setattr(token_exchange, "_MAX_RESPONSE_BYTES", 64)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, text="A" * (_MAX_RESPONSE_BYTES * 4))
+        return httpx.Response(400, text="A" * 100_000)
 
     with pytest.raises(TokenExchangeError) as excinfo:
         exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
 
-    # The snippet is bounded far below the cap by ``scrub_body`` anyway; what
-    # this pins is that the whole 256 KiB never became a Python string.
-    assert len(str(excinfo.value)) < _MAX_RESPONSE_BYTES
+    server_line = next(line for line in str(excinfo.value).splitlines() if "server:" in line)
+    assert server_line.count("A") == 64, f"read was not bounded at the cap: {server_line!r}"
+
+
+def test_read_stops_at_the_wall_clock_deadline():
+    """A slow reply is abandoned even while it stays inside httpx's timeout.
+
+    httpx's timeout is per-operation and resets on every chunk, so a server
+    dribbling one byte just inside each window would otherwise hold this
+    synchronous call -- and with it the event loop -- open indefinitely.
+    """
+    from uc_mcp_proxy.token_exchange import _read_bounded
+
+    delivered: list[int] = []
+
+    class _Chunked(httpx.SyncByteStream):
+        """A body that arrives in many small pieces, like a dribbling server."""
+
+        def __iter__(self):
+            for _ in range(1000):
+                delivered.append(1)
+                yield b"A" * 10
+
+    response = httpx.Response(400, stream=_Chunked())
+
+    # A deadline already in the past, so it trips as soon as it is consulted.
+    body = _read_bounded(response, deadline=0.0)
+
+    # One chunk is unavoidable -- the check runs after the read that produced
+    # it. What matters is that the remaining 999 were never pulled.
+    assert len(body) == 10, f"deadline ignored, read {len(body)} bytes"
+    assert len(delivered) == 1, f"kept reading past the deadline: {len(delivered)} chunks"
 
 
 def test_hostile_reason_phrase_cannot_rewrite_the_terminal():
@@ -474,3 +506,41 @@ def test_hostile_reason_phrase_cannot_rewrite_the_terminal():
         exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
 
     assert "\x1b" not in str(excinfo.value)
+
+
+def test_reason_phrase_cannot_carry_the_pat():
+    """A server can put the credential it just received into its status line.
+
+    Stripping escapes from the reason phrase is not enough. This needs no
+    padding and no positioning: the endpoint echoes the PAT it was sent, and
+    without redaction it prints in full on the line directly above a body the
+    same function successfully protects.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"error": "see status line"},
+            extensions={"reason_phrase": f"Forbidden token={PAT}".encode()},
+        )
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    message = str(excinfo.value)
+    assert PAT not in message
+    assert "<redacted>" in message
+
+
+def test_malformed_host_is_diagnosed_not_raised():
+    """A host httpx cannot parse must not escape as a traceback.
+
+    This frame holds the PAT in its locals, so an uncaught exception here is
+    both a worse message and a disclosure risk under any locals-capturing
+    reporter.
+    """
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(host="https://ws[bad"), transport=httpx.MockTransport(ok_handler))
+
+    assert PAT not in str(excinfo.value)
+    assert "not a usable URL" in str(excinfo.value)

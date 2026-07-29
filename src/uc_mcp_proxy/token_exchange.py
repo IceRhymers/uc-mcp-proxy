@@ -116,12 +116,22 @@ def exchange_pat(
     ``now`` and ``transport`` are test seams; ``transport`` mirrors the one in
     ``_build_http_client``, and httpx ignores ``verify`` when it is supplied.
     """
-    endpoint = _token_endpoint(config.host)
+    try:
+        endpoint = _token_endpoint(config.host)
+        scheme = httpx.URL(endpoint).scheme
+    except (ValueError, httpx.InvalidURL) as exc:
+        # httpx rejects a malformed host before we ever send. Converted rather
+        # than allowed to escape: this frame holds the PAT, and an uncaught
+        # exception here would unwind as a traceback rather than a diagnosis.
+        raise TokenExchangeError(
+            f"uc-mcp-proxy: the profile's host is not a usable URL, so no token endpoint "
+            f"could be derived ({scrub_body(str(exc), [pat])}).\nExiting."
+        ) from exc
     # The PAT rides in the request *body* here, so a cleartext endpoint would
     # put a long-lived full-privilege credential on the wire in the clear. The
     # SDK only prepends https:// when a profile omits the scheme entirely, so a
     # profile with an explicit http:// host reaches this untouched.
-    if httpx.URL(endpoint).scheme != "https":
+    if scheme != "https":
         raise TokenExchangeError(
             f"uc-mcp-proxy: refusing to send a personal access token to a non-HTTPS "
             f"token endpoint ({endpoint}). Fix the profile's host to use https://.\nExiting."
@@ -142,6 +152,11 @@ def exchange_pat(
     # Sampled before the request, not after, so network latency counts against
     # the token's life rather than being silently added to it.
     issued_at = now()
+    # A real ceiling on the whole read. httpx's timeout is per-operation and
+    # resets on every chunk, so an endpoint dribbling one byte just inside each
+    # window holds this synchronous call -- and therefore the event loop, the
+    # stdio bridge, and the abort path -- open indefinitely.
+    deadline = time.monotonic() + config.timeout
 
     try:
         with httpx.Client(
@@ -154,8 +169,8 @@ def exchange_pat(
             # hostile, and this call is holding the event loop while it reads.
             with client.stream("POST", endpoint, data=form, headers={"Authorization": f"Bearer {pat}"}) as response:
                 status = response.status_code
-                reason = scrub_reason(response.reason_phrase or "")
-                body = _read_bounded(response)
+                reason = scrub_reason(response.reason_phrase or "", [pat])
+                body = _read_bounded(response, deadline)
     except httpx.RequestError as exc:
         raise TokenExchangeError(
             _format_failure(
@@ -218,8 +233,13 @@ def exchange_pat(
     )
 
 
-def _read_bounded(response: httpx.Response) -> str:
-    """Read at most ``_MAX_RESPONSE_BYTES`` of ``response``, decoded leniently.
+def _read_bounded(response: httpx.Response, deadline: float) -> str:
+    """Read ``response`` under both a size and a wall-clock bound.
+
+    Two separate limits because they stop two different things: the byte cap
+    stops a large body from being buffered, and the deadline stops a slow one
+    from holding the event-loop thread. httpx's own timeout does neither -- it
+    is per-operation, so every chunk resets it.
 
     ``errors="replace"`` because this text is only ever shown to a human in a
     diagnosis; a body that is not valid UTF-8 is itself the finding, and raising
@@ -230,7 +250,7 @@ def _read_bounded(response: httpx.Response) -> str:
     for chunk in response.iter_bytes():
         chunks.append(chunk)
         size += len(chunk)
-        if size >= _MAX_RESPONSE_BYTES:
+        if size >= _MAX_RESPONSE_BYTES or time.monotonic() > deadline:
             break
     return b"".join(chunks)[:_MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
 

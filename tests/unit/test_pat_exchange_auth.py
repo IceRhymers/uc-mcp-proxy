@@ -486,3 +486,35 @@ def test_authenticate_called_once_per_request(mock_workspace_client_pat, exchang
         flow.send(httpx.Response(200))
 
     assert mock_workspace_client_pat.config.authenticate.call_count == 1
+
+
+def test_empty_stale_token_mints_rather_than_reusing_the_cache(mock_workspace_client_pat, exchange_config):
+    """An empty ``stale`` must not be read as "the cache is fresher than what failed".
+
+    ``stale`` is recovered from the failed attempt's ``Authorization`` header.
+    An empty value means that header was absent, which compares unequal to every
+    cached token -- so an ``is not None`` test would hand back the credential
+    that was just refused and burn the single retry. Unreachable today, since
+    ``_apply_headers`` always sets the header before yielding; pinned so the
+    guard is not removed as redundant.
+    """
+    from uc_mcp_proxy import __main__ as main
+    from uc_mcp_proxy.token_exchange import ExchangedToken
+
+    exchanges: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        exchanges.append(request)
+        return httpx.Response(200, json={"access_token": "freshly-minted", "expires_in": 3600})
+
+    auth = main.DatabricksAuth(
+        mock_workspace_client_pat,
+        exchange=exchange_config,
+        transport=httpx.MockTransport(handler),
+    )
+    auth._cached = ExchangedToken(access_token="already-cached", expires_at=1e12)
+
+    token = auth._token(FAKE_PAT, exchange_config, stale="")
+
+    assert token == "freshly-minted"
+    assert len(exchanges) == 1, "returned the cache instead of re-minting"
