@@ -22,12 +22,34 @@ tests only to match CI.
 
 ## Architecture
 
-Single-module package in `src/uc_mcp_proxy/`:
+Package in `src/uc_mcp_proxy/`:
 
 - `__main__.py` — CLI entry point, `DatabricksAuth` (httpx auth flow), `bridge()` (bidirectional stdio↔HTTP stream copy), `run()` (async main)
+- `auth.py` — credential preflight, auto-login, auth-type-specific remediation
+- `errors.py` — HTTP error diagnosis and reporting from the remote server
 - `__init__.py` — re-exports `DatabricksAuth`
 
 The proxy bridges an MCP stdio transport to a remote Streamable HTTP MCP server, injecting Databricks OAuth tokens on every request via `DatabricksAuth`.
+
+### Error handling
+
+The proxy owns the `httpx.AsyncClient` it hands to the MCP SDK, so that client's
+event hooks are the only place that sees every response on both transport
+paths. This matters because the paths fail in opposite ways: the SDK's GET SSE
+loop swallows failures into `logger.debug` and reconnects, so no exception ever
+escapes it, while the POST path raises from inside a `tg.start_soon` task, which
+surfaces as a traceback rather than a diagnosis.
+
+Failures are classified by *session role*, not HTTP verb — `follow_redirects=True`
+means httpx rewrites POST to GET on 3xx, so the verb no longer describes what the
+request was for. `stamp_role` records the role on the way out.
+
+> The proxy exits when the server refuses a request it actually needed to make.
+> It warns and keeps going when the server refuses a background stream.
+
+Neither hook may raise: httpx re-raises whatever a response hook throws into the
+SDK task that made the request, which is the exact traceback path this design
+removes. Cancellation is the deliberate exception and must propagate.
 
 ## Testing
 

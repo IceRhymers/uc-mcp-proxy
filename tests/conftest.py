@@ -23,6 +23,10 @@ def mock_workspace_client():
     client = MagicMock()
     client.config.host = "https://test-workspace.cloud.databricks.com"
     client.config.authenticate.return_value = {"Authorization": "Bearer test-oauth-token"}
+    # Real strings, not MagicMocks: error messages interpolate these, and a
+    # bare MagicMock is truthy so it would render as "<MagicMock id=...>".
+    client.config.profile = "test-profile"
+    client.config.auth_type = "pat"
     return client
 
 
