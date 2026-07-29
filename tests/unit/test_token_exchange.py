@@ -451,15 +451,26 @@ def test_oversized_response_body_is_bounded(monkeypatch):
     from uc_mcp_proxy import token_exchange
 
     monkeypatch.setattr(token_exchange, "_MAX_RESPONSE_BYTES", 64)
+    delivered: list[int] = []
+
+    class _Chunked(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(1000):
+                delivered.append(1)
+                yield b"A" * 32
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, text="A" * 100_000)
+        return httpx.Response(400, stream=_Chunked())
 
-    with pytest.raises(TokenExchangeError) as excinfo:
+    with pytest.raises(TokenExchangeError):
         exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
 
-    server_line = next(line for line in str(excinfo.value).splitlines() if "server:" in line)
-    assert server_line.count("A") == 64, f"read was not bounded at the cap: {server_line!r}"
+    # Counted in chunks, not characters: the cap stops the *read*, and one
+    # chunk past it is unavoidable because the check follows the read that
+    # produced it. Asserting on the rendered text instead would be satisfied
+    # by ``scrub_body``'s own 500-char limit and would pass against a
+    # completely unbounded read -- which an earlier version of this test did.
+    assert len(delivered) <= 3, f"read {len(delivered)} chunks; the cap did not stop it"
 
 
 def test_read_stops_at_the_wall_clock_deadline():

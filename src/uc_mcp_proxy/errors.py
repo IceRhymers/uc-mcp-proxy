@@ -94,6 +94,16 @@ _REDACTED = "<redacted>"
 #: gigabytes to produce a few hundred characters.
 _MAX_SNIPPET_BYTES = 64 * 1024
 
+#: Above this, a secret is matched literally rather than as an interleaved
+#: pattern. Building one is linear in the needle's length, and a server picks
+#: the length of ``mcp-session-id``.
+_MAX_PATTERN_CHARS = 256
+
+#: Shortest surviving fragment of a severed secret still worth redacting.
+#: Below this the fragment carries little and false positives would start
+#: mangling ordinary text at the tail of a snippet.
+_MIN_PARTIAL_SECRET = 4
+
 
 @functools.lru_cache(maxsize=1)
 def _control_chars() -> dict[int, None]:
@@ -108,14 +118,21 @@ def _control_chars() -> dict[int, None]:
     to anyone reading the log. Categories close the class; a list closes
     whichever members somebody thought of.
 
-    Whitespace is deliberately not excluded: this runs after the collapse, so
-    the only whitespace left is the single space the collapse produced, and
-    ``U+0020`` is ``Zs`` rather than ``Cc``.
+    Whitespace-like control characters (tab, newline, the C0 separators) are
+    excluded so that the *collapse* handles them. Deleting them here instead
+    would run words together, and -- far worse -- it would let a deletion
+    re-create a whitespace run after the collapse had already normalized one
+    away, which is the property the redactor's regex depends on being
+    impossible.
 
     Built lazily and cached -- the scan is ~100ms, and it is only ever needed
     on a path that is already about to print a diagnosis.
     """
-    return dict.fromkeys(cp for cp in range(sys.maxunicode + 1) if unicodedata.category(chr(cp)) in ("Cc", "Cf"))
+    return dict.fromkeys(
+        cp
+        for cp in range(sys.maxunicode + 1)
+        if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+    )
 
 
 async def stamp_role(request: httpx.Request) -> None:
@@ -214,6 +231,20 @@ def remediation(request: httpx.Request) -> str | None:
     return text if isinstance(text, str) else None
 
 
+def _normalize(text: str) -> str:
+    """Strip invisible characters, then flatten whitespace runs to one space.
+
+    Both halves of every comparison go through this, so a credential echoed
+    with something hidden inside it lands in the same shape as the needle.
+
+    The order is the load-bearing part: stripping *after* collapsing would let
+    a deletion re-create a whitespace run the collapse had already flattened,
+    and the redactor's pattern is only free of ambiguity because no such run
+    can exist.
+    """
+    return " ".join(text.translate(_control_chars()).split())
+
+
 def scrub_body(text: str, secrets: Sequence[str]) -> str:
     """Return ``text`` safe to print: normalized, then secrets removed, then bounded.
 
@@ -236,15 +267,47 @@ def scrub_body(text: str, secrets: Sequence[str]) -> str:
     credential in the body as well as the header, shares this one
     implementation of the terminal-escape defense rather than growing a second.
     """
-    scrubbed = " ".join(text.split()).translate(_control_chars())
-    for secret in secrets:
-        if not secret:
+    # Strip first, collapse LAST. The reverse order looks equivalent and is not:
+    # deleting control characters after the collapse re-creates whitespace runs
+    # the collapse had already flattened (``"A \x00 \x00 B"`` -> ``"A   B"``),
+    # and the regex below is only safe because no such run can exist.
+    scrubbed = _normalize(text)
+    # Longest first, so a secret that is a prefix of another cannot redact the
+    # short one and leave the longer one's tail exposed.
+    ordered = sorted(secrets, key=len, reverse=True)
+    for secret in ordered:
+        # Normalized the same way the haystack was, so a credential carrying a
+        # control character matches the text after that character is stripped.
+        needle = _normalize(secret)
+        if not needle:
             continue
-        # One pass, tolerant of the single space a collapsed whitespace run
-        # leaves behind. Anchored on the secret's own characters and facing a
-        # haystack with no multi-character whitespace run, so each ``\s*`` can
-        # match at most one character and it cannot backtrack.
-        scrubbed = re.sub(r"\s*".join(map(re.escape, secret)), _REDACTED, scrubbed)
+        if " " in needle or len(needle) > _MAX_PATTERN_CHARS:
+            # Exact match only. An interleaved pattern built from a needle that
+            # itself contains whitespace is ambiguous at every space, and one
+            # built from a very long needle is linear in its length -- and
+            # ``mcp-session-id`` is a server-chosen secret with no validation
+            # anywhere in the SDK, so both are attacker-reachable.
+            scrubbed = scrubbed.replace(needle, _REDACTED)
+            continue
+        # ``\s?``, not ``\s*``: the collapse ran last, so the haystack holds no
+        # whitespace run longer than one, and the needle holds none at all.
+        # Each group therefore has a single admissible match and cannot
+        # backtrack combinatorially.
+        scrubbed = re.sub(r"\s?".join(map(re.escape, needle)), _REDACTED, scrubbed)
+
+    # A secret can also be severed *before* this function is reached: the
+    # callers stop reading at a byte cap, and that cap can land in the middle
+    # of a credential. What survives is a prefix at the very end of the text,
+    # which matches nothing above -- and if the discarded remainder was mostly
+    # control characters, the prefix sits well inside the visible window rather
+    # than being cut away by the truncation below. Reading further is not a fix
+    # (the next cap has the same edge), so the trailing edge is swept here.
+    for secret in ordered:
+        needle = _normalize(secret)
+        for length in range(len(needle) - 1, _MIN_PARTIAL_SECRET - 1, -1):
+            if scrubbed.endswith(needle[:length]):
+                scrubbed = scrubbed[:-length] + _REDACTED
+                break
     # Truncation happens last and nothing truncates before it. Any earlier cut
     # -- including a "just to bound the work" one -- can sever a secret and let
     # the surviving half through, which is the whole hazard this ordering
@@ -421,7 +484,11 @@ class HttpErrorReporter:
             read_ok = True
         if not read_ok:
             return ""
-        text = b"".join(chunks)[:_MAX_SNIPPET_BYTES].decode("utf-8", errors="replace")
+        # No slice. The loop above already stopped one chunk past the cap, and
+        # a cut here would sever a straddling secret so the surviving half no
+        # longer matches -- the exact hazard that put half a PAT on stderr
+        # twice already. Nothing may truncate between the read and ``scrub_body``.
+        text = b"".join(chunks).decode("utf-8", errors="replace")
         return scrub_body(text, self._secrets(response.request))
 
     def _secrets(self, request: httpx.Request) -> list[str]:

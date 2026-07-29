@@ -252,7 +252,9 @@ def _read_bounded(response: httpx.Response, deadline: float) -> str:
         size += len(chunk)
         if size >= _MAX_RESPONSE_BYTES or time.monotonic() > deadline:
             break
-    return b"".join(chunks)[:_MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
+    # No slice: the loop already bounded this, and a cut here would sever a
+    # straddling secret before ``scrub_body`` ever sees it.
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _token_endpoint(host: str) -> str:

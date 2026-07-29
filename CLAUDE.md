@@ -99,17 +99,27 @@ only the response hook can populate the latter.
 ### Printing server-controlled text
 
 `scrub_body` normalizes **before** it redacts, and that order is the opposite of
-the intuitive one. Collapsing and the control strip both *delete* characters, so
-redacting first lets a server hide a credential from `str.replace` by echoing it
-with one byte inserted — and then the strip removes that byte and reassembles
-the secret verbatim on its way to stderr. A separator-tolerant pass follows,
-because a run of whitespace collapses to a single space rather than vanishing.
+the intuitive one. Normalizing deletes characters, so redacting first lets a
+server hide a credential from `str.replace` by echoing it with one byte inserted
+— and then the strip removes that byte and reassembles the secret verbatim on
+its way to stderr. Both the haystack and each needle go through `_normalize`, so
+they cannot drift.
 
-**Nothing may truncate before redaction — including a bound added "just to
-limit the work".** An earlier version capped the redaction window at 8 KiB and
-so severed any secret straddling it, printing the half that survived. Callers
-bound the *read* instead (`_MAX_SNIPPET_BYTES`, `_MAX_RESPONSE_BYTES`), which
-limits memory without ever cutting a secret in two.
+Inside `_normalize` the order matters again, and the other way round: **strip
+invisible characters first, collapse whitespace last.** Collapsing first lets a
+later deletion re-join the spaces either side of it and re-create a run the
+collapse had already flattened. The redactor's pattern is `\s?` rather than
+`\s*` precisely because no run longer than one can exist — and when that
+stopped being true, a server-chosen `mcp-session-id` containing spaces drove the
+match into catastrophic backtracking: 5.8 seconds at nine spaces, growing ~3.5×
+per space, on the thread that also runs the abort path.
+
+**Truncation is the recurring hazard.** Nothing may cut between the read and
+`scrub_body`, because a cut severs a secret and the surviving half matches
+nothing. That bug shipped twice — once as an 8 KiB redaction window, once as a
+byte slice after the read loop. The read caps themselves still land wherever
+they land, so `scrub_body` finishes by sweeping a trailing partial secret off
+the end; reading further is not a fix, since the next cap has the same edge.
 
 The stripped character set is derived from Unicode categories (`Cc` + `Cf`), not
 enumerated. An enumerated list was wrong twice: stripping the escapes that move

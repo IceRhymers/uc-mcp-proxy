@@ -1171,3 +1171,111 @@ async def test_guard_fails_closed_when_the_origin_cannot_be_determined():
     await guard_forwarded_token(request)  # must not raise
 
     assert "X-Forwarded-Access-Token" not in request.headers
+
+
+# ---------------------------------------------------------------------------
+# 31: a secret severed by the read cap must not print its surviving half
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("straddle", [4, 6, 20, 27], ids=lambda n: f"cut_leaves_{n}")
+def test_secret_severed_by_the_read_cap_is_not_printed(straddle):
+    """The read stops at a byte cap, and that cap can land inside a credential.
+
+    Redaction cannot match what was already cut, and reading further does not
+    help -- the next cap has the same edge. What survives is a prefix at the end
+    of the text, and if the discarded remainder was mostly invisible characters
+    it sits well inside the visible window rather than being truncated away.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    severed = "\x01" * 300 + "A" * 40 + secret[:straddle]
+
+    result = scrub_body(severed, [secret])
+
+    longest = max((n for n in range(len(secret), 3, -1) if secret[:n] in result), default=0)
+    assert longest == 0, f"leaked a {longest}-character prefix: {result[-50:]!r}"
+
+
+def test_a_short_trailing_coincidence_is_left_alone():
+    """The trailing sweep must not mangle ordinary text.
+
+    Counterpart to the test above: a fragment too short to be worth anything is
+    not worth false-positives either.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    assert scrub_body("the value is da", ["dapiDEADBEEF0123456789abcdef"]).endswith("da")
+
+
+# ---------------------------------------------------------------------------
+# 32: the redactor's pattern must stay unambiguous
+# ---------------------------------------------------------------------------
+
+
+def test_stripping_control_characters_cannot_recreate_a_whitespace_run():
+    """Collapse runs last, so no run longer than one space can survive.
+
+    Stripping after collapsing looks equivalent and is not: deleting a control
+    character re-joins the spaces either side of it, re-creating a run the
+    collapse had already flattened. The redactor's pattern is only free of
+    ambiguity because such a run cannot exist, so this is load-bearing.
+    """
+    import re as _re
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    result = scrub_body("A" + " \x00" * 12 + "B", [])
+
+    longest = max((len(run) for run in _re.findall(r" +", result)), default=0)
+    assert longest <= 1, f"whitespace run of {longest} survived: {result!r}"
+
+
+def test_a_server_chosen_secret_cannot_make_redaction_expensive():
+    """``mcp-session-id`` is server-authored, unvalidated, and used as a secret.
+
+    A secret carrying whitespace once produced an ambiguous pattern group per
+    space; against a whitespace run that is combinatorial, and this runs
+    synchronously inside a response hook, so the stdio bridge and the abort
+    path both stop with it. Timed rather than asserted structurally because the
+    failure mode is latency, not a wrong answer.
+    """
+    import time
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    body = "S" + " \x00" * 40 + "X"
+
+    started = time.perf_counter()
+    for spaces in range(4, 20):
+        scrub_body(body, ["S" + " " * spaces + "E"])
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"redaction took {elapsed:.1f}s; the pattern is backtracking"
+
+
+def test_a_very_long_server_chosen_secret_is_matched_literally():
+    """Pattern construction is linear in the needle, and the server picks it."""
+    import time
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "S" * 16384
+
+    started = time.perf_counter()
+    # Secret first, so the redaction is inside the visible window rather than
+    # being cut away by the snippet limit -- the assertion is about the cost of
+    # the match, but it should not pass merely because nothing was printed.
+    result = scrub_body(secret + "A" * 60000, [secret])
+    elapsed = time.perf_counter() - started
+
+    assert result.startswith("<redacted>")
+    assert elapsed < 1.0, f"took {elapsed:.1f}s"
+
+
+def test_a_secret_that_prefixes_another_does_not_shadow_it():
+    """Longest-first, or the short one redacts and leaves the long one's tail."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    assert scrub_body("x AAAABBBB y", ["AAAA", "AAAABBBB"]) == "x <redacted> y"
