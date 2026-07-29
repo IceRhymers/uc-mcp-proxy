@@ -23,13 +23,40 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from collections.abc import Sequence
 
 import anyio
 import httpx
 
+
+class ProxyFatalError(Exception):
+    """A proxy-side failure that has already been diagnosed to stderr.
+
+    Raised only after the diagnosis has been emitted, so the backstop in
+    ``__main__`` may swallow it: re-raising would print a traceback whose only
+    new information is a line number.
+
+    Derives from ``Exception``, never ``BaseException``, and that choice is
+    load-bearing in two places inside the MCP SDK. ``_handle_get_stream``
+    catches ``except Exception`` and reconnects, so a failure on the background
+    stream stays non-fatal; ``terminate_session`` catches ``except Exception``
+    so a failure during teardown cannot turn a clean shutdown into a crash. A
+    ``BaseException`` here would slip past both and invert the request-vs-stream
+    fatality rule this module exists to encode.
+    """
+
+
 _BODY_SNIPPET_LIMIT = 500
 _BODY_READ_TIMEOUT = 5.0
 _ROLE_KEY = "uc_mcp_role"
+
+#: Set on a request whose 401 the auth layer will retry. Mechanical on purpose:
+#: this module never learns *why* a retry is pending, only that one is, so the
+#: same machinery serves any future credential-refresh path.
+_RETRY_KEY = "uc_mcp_retry_armed"
+#: Proxy-authored remediation text for a 401/403 on this request. Authored here
+#: in the proxy, never by the server, so it needs no scrubbing.
+_REMEDIATION_KEY = "uc_mcp_remediation"
 
 #: JSON-RPC requests and notifications. The channel the user's tool calls ride
 #: on -- a refusal here is fatal.
@@ -80,6 +107,65 @@ async def stamp_role(request: httpx.Request) -> None:
         )
 
 
+def arm_retry(request: httpx.Request, *, armed: bool) -> None:
+    """Record whether a 401 on ``request`` will be retried by the auth layer.
+
+    Assigns unconditionally, unlike ``stamp_role``'s ``setdefault``. The two
+    keys want opposite semantics on the same dict and the difference is easy to
+    get backwards, so ``armed`` is keyword-only to make the transition visible
+    at every call site: a role is an immutable property of the logical
+    operation and must survive a redirect rewrite, while the retry marker is a
+    property of the current attempt and must flip ``True`` -> ``False`` when
+    the retry itself goes out.
+
+    Callers must pass the *original* request, never ``response.request``. Under
+    a redirect the latter is that hop's snapshot -- httpx copies extensions per
+    hop rather than sharing them -- so disarming it would write into a dict
+    that is then discarded, the rebuilt retry would still read as armed, both
+    401s would be suppressed, and the proxy would hang with no diagnosis at all.
+    """
+    with contextlib.suppress(Exception):
+        request.extensions[_RETRY_KEY] = armed
+
+
+def retry_armed(request: httpx.Request) -> bool:
+    """True if a 401 on ``request`` is about to be retried."""
+    return bool(request.extensions.get(_RETRY_KEY, False))
+
+
+def set_remediation(request: httpx.Request, text: str) -> None:
+    """Attach proxy-authored remediation text for a 401/403 on ``request``."""
+    with contextlib.suppress(Exception):
+        request.extensions[_REMEDIATION_KEY] = text
+
+
+def remediation(request: httpx.Request) -> str | None:
+    """Return the proxy-authored remediation for ``request``, if any."""
+    text = request.extensions.get(_REMEDIATION_KEY)
+    return text if isinstance(text, str) else None
+
+
+def scrub_body(text: str, secrets: Sequence[str]) -> str:
+    """Return ``text`` safe to print: secrets removed, then bounded.
+
+    The step order is load-bearing. Redaction runs first so that a secret
+    straddling the truncation boundary cannot be half-printed, and the control
+    strip runs after collapsing because collapsing whitespace does not remove
+    ESC -- without it a server could emit cursor-movement and erase sequences
+    that overwrite the diagnosis above with text of its own choosing.
+
+    Secret-agnostic so the token-exchange path, whose request carries a
+    credential in the body as well as the header, shares this one
+    implementation of the terminal-escape defense rather than growing a second.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    collapsed = " ".join(text.split())
+    # Stripped after collapsing, so the limit counts characters the user sees.
+    return collapsed.translate(_CONTROL_CHARS)[:_BODY_SNIPPET_LIMIT]
+
+
 class HttpErrorReporter:
     """Reports HTTP failures from the remote MCP server and signals shutdown.
 
@@ -99,6 +185,48 @@ class HttpErrorReporter:
         self.last_message: str | None = None
         self.reported: set[tuple[str, int]] = set()
         self.shutting_down = False
+
+    @property
+    def diagnosed(self) -> bool:
+        """True once any diagnosis has reached stderr, from either entrance.
+
+        ``reported`` is keyed on ``(role, status)`` and only ``_report`` can
+        populate it, so a proxy-side failure -- which has no response and
+        therefore neither a role nor a status -- would leave it empty. The
+        backstop in ``__main__`` reads this instead, so both entrances answer
+        the one question it actually asks: has the user already been told?
+        """
+        return bool(self.reported) or self.fatal_message is not None
+
+    def report_fatal(self, message: str) -> None:
+        """Report a proxy-side failure that has no server response behind it.
+
+        The second entrance into this class. ``_report`` is driven by httpx's
+        response hook and keys everything off an ``httpx.Response``; this one is
+        called by the auth layer when the *proxy* failed instead of the server.
+        Both must leave this object in the same state and obey the same guards,
+        because ``run()`` reads only that state.
+
+        Returns early while shutting down, symmetric with ``_report``. The SDK's
+        teardown DELETE goes out through the same auth flow, so on a session
+        that outlived its token this can be reached by an exchange the user
+        never asked for; a clean multi-hour session must not exit non-zero
+        because a credential refresh failed on the way out the door.
+
+        On the background GET stream the SDK swallows the raised failure into
+        ``logger.debug`` and reconnects, so this print is the *only* signal the
+        user ever gets. It is not redundant with the raise.
+        """
+        if self.shutting_down:
+            return
+        # Idempotent: every in-flight request re-runs the failing refresh, and
+        # the user needs the diagnosis once, not once per request.
+        if self.fatal_message is not None:
+            return
+        print(message, file=sys.stderr)
+        self.last_message = message
+        self.fatal_message = message
+        self.fatal.set()
 
     async def on_response(self, response: httpx.Response) -> None:
         """httpx ``response`` event hook. Never raises except on cancellation."""
@@ -120,6 +248,23 @@ class HttpErrorReporter:
         # holds even if a future SDK deletes at some other moment.
         if role == ROLE_TEARDOWN:
             return  # pragma: no cover
+        if response.status_code == 401 and retry_armed(response.request):
+            # The auth layer re-mints the credential and retries this exactly
+            # once. Reporting here would set ``fatal_message`` and fire
+            # ``fatal``, and ``_watch_fatal`` would ``_abort()`` the process
+            # before the retry was ever dispatched -- httpx runs response event
+            # hooks strictly before it hands the response back to the auth flow.
+            #
+            # Returning here, rather than after the dedup check below, is
+            # deliberate on both sides: nothing is added to ``reported``, so a
+            # suppressed 401 neither consumes the ``(role, status)`` slot the
+            # real report will need nor makes ``diagnosed`` true; and the body
+            # is left unread, so httpx can still consume it on the way back up.
+            print(
+                "uc-mcp-proxy: credential rejected (401); refreshing and retrying once.",
+                file=sys.stderr,
+            )
+            return
         key = (role, response.status_code)
         if key in self.reported:
             return
@@ -166,21 +311,15 @@ class HttpErrorReporter:
             text = response.text
         except Exception:  # pragma: no cover - guarded by read_ok
             return ""
-        collapsed = " ".join(self._redact(text, response.request).split())
-        # Stripped after collapsing, so the limit counts characters the user sees.
-        return collapsed.translate(_CONTROL_CHARS)[:_BODY_SNIPPET_LIMIT]
+        return scrub_body(text, self._secrets(response.request))
 
-    def _redact(self, text: str, request: httpx.Request) -> str:
-        """Strip credentials from ``text`` in case the server echoed them back."""
+    def _secrets(self, request: httpx.Request) -> list[str]:
+        """Credentials carried by ``request`` that a server could echo back."""
         authorization = request.headers.get("Authorization", "")
-        secrets = [
+        return [
             authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else "",
             *(request.headers.get(header, "") for header in _SECRET_HEADERS),
         ]
-        for secret in secrets:
-            if secret:
-                text = text.replace(secret, "<redacted>")
-        return text
 
     def _format(self, response: httpx.Response, snippet: str, *, fatal: bool) -> str:
         headline, remediation = self._diagnose(response)
@@ -207,11 +346,17 @@ class HttpErrorReporter:
         """
         status = response.status_code
         reason = response.reason_phrase or ""
+        # Proxy-authored, never server-authored, so it needs no scrubbing. Only
+        # the remediation is substituted; the headline stays as written, which
+        # is what keeps this module from having to know what the proxy did to
+        # the credential before sending it.
+        proxy_remediation = remediation(response.request)
 
         if status == 401:
             return (
                 f"uc-mcp-proxy: the remote MCP server rejected your credentials (HTTP {status} {reason}).",
-                f"The token for profile {self.profile!r} was minted successfully, so the "
+                proxy_remediation
+                or f"The token for profile {self.profile!r} was minted successfully, so the "
                 f"server rejected it rather than it being absent locally. The token may "
                 f"have expired, or this profile's identity may not be recognized by the "
                 f"target.",
@@ -219,7 +364,12 @@ class HttpErrorReporter:
         if status == 403:
             return (
                 f"uc-mcp-proxy: the remote MCP server refused this request (HTTP {status} {reason}).",
-                f"The credential for profile {self.profile!r} authenticated successfully "
+                # The default text advises OAuth U2M -- a browser login. When
+                # the proxy has already exchanged the credential for this
+                # target, that is the one remedy it just made unnecessary, and
+                # the audience this feature exists for has no browser.
+                proxy_remediation
+                or f"The credential for profile {self.profile!r} authenticated successfully "
                 f"but is not authorized for this target. If the target is a Databricks "
                 f"App, it may require OAuth U2M rather than a PAT.",
             )
@@ -286,3 +436,15 @@ def is_only_http_status_errors(exc: BaseException) -> bool:
     """
     leaves = _leaves(exc)
     return bool(leaves) and all(isinstance(leaf, httpx.HTTPStatusError) for leaf in leaves)
+
+
+def is_only_diagnosed_errors(exc: BaseException) -> bool:
+    """True if every leaf of ``exc`` has already been diagnosed to stderr.
+
+    Generalizes ``is_only_http_status_errors`` to the second failure shape: a
+    ``ProxyFatalError`` the proxy raised *after* reporting it. Keeps the same
+    positive, non-empty match, so a bare ``CancelledError`` still answers False
+    and Ctrl-C is never reported as a credential rejection.
+    """
+    leaves = _leaves(exc)
+    return bool(leaves) and all(isinstance(leaf, (httpx.HTTPStatusError, ProxyFatalError)) for leaf in leaves)

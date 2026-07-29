@@ -13,6 +13,16 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+#: The workspace host both client fixtures resolve to. The token-exchange
+#: endpoint is derived from this, never from the app host.
+HOST = "https://test-workspace.cloud.databricks.com"
+
+#: The PAT ``mock_workspace_client_pat`` hands out. Deliberately distinctive so
+#: that "this string reached no header / no message" assertions are non-vacuous:
+#: a generic value could match by accident and pass while leaking.
+FAKE_PAT = "dapi-fake-pat-DO-NOT-LOG"
+
+
 @pytest.fixture
 def mock_workspace_client():
     """Mock WorkspaceClient with OAuth token access.
@@ -21,13 +31,43 @@ def mock_workspace_client():
     fresh auth headers on each call.
     """
     client = MagicMock()
-    client.config.host = "https://test-workspace.cloud.databricks.com"
+    client.config.host = HOST
     client.config.authenticate.return_value = {"Authorization": "Bearer test-oauth-token"}
     # Real strings, not MagicMocks: error messages interpolate these, and a
     # bare MagicMock is truthy so it would render as "<MagicMock id=...>".
     client.config.profile = "test-profile"
+    # An OAuth token, so the auth_type must name an OAuth flow. Declaring "pat"
+    # here while handing out a bearer OAuth token described a profile that
+    # cannot exist, and the omit-the-forwarded-header rule keyed on auth_type
+    # turns that contradiction into a KeyError. PAT coverage now lives on
+    # ``mock_workspace_client_pat`` -- wire that in rather than flipping this
+    # one back.
+    client.config.auth_type = "databricks-cli"
+    return client
+
+
+@pytest.fixture
+def mock_workspace_client_pat():
+    """Mock WorkspaceClient for a PAT profile — the token-exchange subject."""
+    client = MagicMock()
+    client.config.host = HOST
+    client.config.authenticate.return_value = {"Authorization": f"Bearer {FAKE_PAT}"}
+    client.config.profile = "test-profile"
     client.config.auth_type = "pat"
     return client
+
+
+@pytest.fixture
+def exchange_config():
+    """An ``ExchangeConfig`` pointing at the fixture workspace host."""
+    from uc_mcp_proxy.token_exchange import ExchangeConfig
+
+    return ExchangeConfig(
+        host=HOST,
+        client_id="00000000-1111-2222-3333-444444444444",
+        scopes=("sql", "dashboards.genie"),
+        verify_ssl=True,
+    )
 
 
 # ---------------------------------------------------------------------------

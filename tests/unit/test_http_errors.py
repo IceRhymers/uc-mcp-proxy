@@ -492,3 +492,334 @@ async def test_control_characters_are_stripped_from_the_body_snippet(capsys):
     # ...but only inside the server-echo line, which the real diagnosis frames.
     assert "the remote MCP server failed" in err
     assert err.rstrip().endswith("Exiting.")
+
+
+# ---------------------------------------------------------------------------
+# 17: an armed retry suppresses exactly one 401, and only a 401
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_armed_401_is_suppressed_and_leaves_no_trace(capsys):
+    """An armed 401 prints a retry notice but must not consume the dedup slot.
+
+    Leaving ``reported`` untouched is load-bearing: a suppressed 401 must not
+    consume the ``(role, status)`` dedup slot the real report will need, or a
+    second 401 -- the retry's own -- would be silently swallowed by the dedup
+    check instead of reported.
+    """
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(401)
+    arm_retry(response.request, armed=True)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1
+    assert "retry" in err.lower()
+    assert reporter.reported == set()
+    assert reporter.fatal_message is None
+    assert not reporter.fatal.is_set()
+    assert reporter.diagnosed is False
+
+
+@pytest.mark.anyio
+async def test_unarmed_401_is_reported_normally(capsys):
+    """Non-vacuous counterpart to the armed case: an unarmed 401 is reported."""
+    reporter = make_reporter()
+    response = make_response(401)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert reporter.reported == {("request", 401)}
+    assert reporter.fatal_message is not None
+    assert reporter.fatal.is_set()
+    assert reporter.diagnosed is True
+
+
+@pytest.mark.anyio
+async def test_armed_non_401_is_still_reported(capsys):
+    """Suppression is 401-only: an armed request still reports a 500."""
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(500)
+    arm_retry(response.request, armed=True)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "500" in err
+    assert reporter.reported == {("request", 500)}
+    assert reporter.fatal.is_set()
+
+
+@pytest.mark.anyio
+async def test_disarmed_retry_401_is_reported(capsys):
+    """A retry marker flipped back off no longer suppresses the 401."""
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(401)
+    arm_retry(response.request, armed=True)
+    arm_retry(response.request, armed=False)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert reporter.reported == {("request", 401)}
+    assert reporter.fatal.is_set()
+    assert reporter.fatal_message is not None
+
+
+# ---------------------------------------------------------------------------
+# 18: proxy-authored remediation replaces the generic 401/403 advice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_proxy_remediation_replaces_the_generic_401_text(capsys):
+    """Proxy-authored remediation substitutes for the default 401 wording."""
+    from uc_mcp_proxy.errors import set_remediation
+
+    reporter = make_reporter()
+    response = make_response(401)
+    set_remediation(response.request, "SENTINEL-REMEDIATION")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "SENTINEL-REMEDIATION" in err
+    assert "may have expired" not in err.lower()
+    assert "rejected your credentials" in err.lower()
+
+
+@pytest.mark.anyio
+async def test_proxy_remediation_replaces_the_403_oauth_u2m_advice(capsys):
+    """Proxy-authored remediation substitutes for the default 403 wording.
+
+    When the proxy has already exchanged the credential for this target,
+    advising a browser login is the one remedy it just made unnecessary --
+    and this feature's audience has no browser.
+    """
+    from uc_mcp_proxy.errors import set_remediation
+
+    reporter = make_reporter()
+    response = make_response(403)
+    set_remediation(response.request, "SENTINEL-REMEDIATION")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "SENTINEL-REMEDIATION" in err
+    assert "OAuth U2M" not in err
+
+
+@pytest.mark.anyio
+async def test_403_without_remediation_keeps_the_default_advice(capsys):
+    """Non-vacuous counterpart: with no remediation set, the default persists."""
+    reporter = make_reporter()
+
+    await reporter.on_response(make_response(403))
+
+    err = capsys.readouterr().err
+    assert "OAuth U2M" in err
+
+
+# ---------------------------------------------------------------------------
+# 19: report_fatal is the second entrance, reserved for proxy-side failures
+# ---------------------------------------------------------------------------
+
+
+def test_report_fatal_sets_every_field_the_backstop_reads(capsys):
+    """One call to ``report_fatal`` leaves the whole post-state consistent."""
+    reporter = make_reporter()
+    message = "uc-mcp-proxy: token exchange failed."
+
+    reporter.report_fatal(message)
+
+    err = capsys.readouterr().err
+    assert err.count(message) == 1
+    assert reporter.fatal_message == message
+    assert reporter.last_message == message
+    assert reporter.fatal.is_set()
+    assert reporter.reported == set()
+    assert reporter.diagnosed is True
+
+
+def test_report_fatal_is_idempotent_and_silent_while_shutting_down(capsys):
+    """A second call is silent, and so is any call made during shutdown.
+
+    The SDK's teardown DELETE goes out through the same auth flow, so a
+    session that outlived its token can reach this on the way out. A clean
+    multi-hour session must not exit non-zero because a refresh failed during
+    shutdown.
+    """
+    reporter = make_reporter()
+    first_message = "uc-mcp-proxy: token exchange failed."
+    reporter.report_fatal(first_message)
+    capsys.readouterr()
+
+    reporter.report_fatal("uc-mcp-proxy: a different message entirely.")
+
+    assert capsys.readouterr().err == ""
+    assert reporter.fatal_message == first_message
+    assert reporter.last_message == first_message
+
+    shutting_down_reporter = make_reporter()
+    shutting_down_reporter.shutting_down = True
+
+    shutting_down_reporter.report_fatal(first_message)
+
+    assert capsys.readouterr().err == ""
+    assert shutting_down_reporter.fatal_message is None
+    assert shutting_down_reporter.last_message is None
+    assert not shutting_down_reporter.fatal.is_set()
+
+
+# ---------------------------------------------------------------------------
+# 20: diagnosed answers "has the user already been told?" from either entrance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("trigger", ["reported_failure", "report_fatal"])
+async def test_diagnosed_is_true_from_either_entrance(trigger):
+    """Both ``_report`` and ``report_fatal`` flip ``diagnosed`` to True."""
+    reporter = make_reporter()
+    assert reporter.diagnosed is False
+
+    if trigger == "reported_failure":
+        await reporter.on_response(make_response(500))
+    else:
+        reporter.report_fatal("uc-mcp-proxy: proxy-side failure.")
+
+    assert reporter.diagnosed is True
+
+
+# ---------------------------------------------------------------------------
+# 21: is_only_diagnosed_errors generalizes the swallow decision to ProxyFatalError
+# ---------------------------------------------------------------------------
+
+
+def make_proxy_fatal_error():
+    from uc_mcp_proxy.errors import ProxyFatalError
+
+    return ProxyFatalError("diagnosed already")
+
+
+class _EmptyGroupStub(BaseException):
+    """Duck-types as an exception group with zero leaves.
+
+    The real ``BaseExceptionGroup`` constructor refuses an empty sequence, so
+    an actual empty group cannot be built; this stands in for one to exercise
+    the ``bool(leaves)`` guard in ``_leaves``' caller.
+    """
+
+    exceptions: tuple[BaseException, ...] = ()
+
+
+DIAGNOSED_SWALLOW_CASES = {
+    "bare_http_status_error": lambda: make_status_error(),
+    "bare_proxy_fatal_error": lambda: make_proxy_fatal_error(),
+    "group_of_status_and_proxy_fatal": lambda: _BaseExceptionGroup(
+        "g", [make_status_error(), make_proxy_fatal_error()]
+    ),
+}
+
+DIAGNOSED_RERAISE_CASES = {
+    "bare_cancelled": lambda: asyncio.CancelledError(),
+    "bare_runtime_error": lambda: RuntimeError("boom"),
+    "group_with_runtime_error": lambda: _BaseExceptionGroup("g", [make_status_error(), RuntimeError("boom")]),
+    "empty_group": lambda: _EmptyGroupStub(),
+}
+
+
+@pytest.mark.parametrize("factory", DIAGNOSED_SWALLOW_CASES.values(), ids=list(DIAGNOSED_SWALLOW_CASES))
+def test_is_only_diagnosed_errors_accepts_status_and_proxy_fatal_leaves(factory):
+    """Groups whose every leaf is a status error or a ``ProxyFatalError`` pass."""
+    from uc_mcp_proxy.errors import is_only_diagnosed_errors
+
+    assert is_only_diagnosed_errors(factory()) is True
+
+
+@pytest.mark.parametrize("factory", DIAGNOSED_RERAISE_CASES.values(), ids=list(DIAGNOSED_RERAISE_CASES))
+def test_is_only_diagnosed_errors_rejects_anything_else(factory):
+    """Cancellation, other exceptions, and an empty group must reach the caller.
+
+    The empty and cancelled cases are why this is a positive, non-empty match
+    -- otherwise the backstop would swallow a Ctrl-C and report it as a
+    credential rejection.
+    """
+    from uc_mcp_proxy.errors import is_only_diagnosed_errors
+
+    assert is_only_diagnosed_errors(factory()) is False
+
+
+# ---------------------------------------------------------------------------
+# 22: scrub_body redacts before truncating and strips terminal control codes
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_body_redacts_before_truncating():
+    """A secret straddling the 500-char boundary must be fully redacted.
+
+    Truncating first would half-print a credential: the portion of the raw
+    secret that falls inside the first 500 characters would survive even
+    though the rest was cut off.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "SECRET-XYZ-1234567890ABCDEFGH"  # 30 chars
+    padding = "a" * 490
+    text = padding + secret  # secret spans chars 490-519, straddling char 500
+
+    result = scrub_body(text, [secret])
+
+    assert secret not in result
+    assert "<redacted>" in result
+    assert len(result) <= 500
+
+
+def test_scrub_body_strips_control_characters():
+    """ESC and CSI sequences are removed from the scrubbed text."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    hostile = "before\x1b[31mafter\x9b1mtail\x07end"
+
+    result = scrub_body(hostile, [])
+
+    assert "\x1b" not in result
+    assert "\x9b" not in result
+    assert "\x07" not in result
+
+
+def test_scrub_body_collapses_whitespace_and_truncates():
+    """Newlines and tabs collapse to single spaces, and output is bounded."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    text = "line one\n\t line two\r\n" * 50
+
+    result = scrub_body(text, [])
+
+    assert len(result) <= 500
+    assert "\n" not in result
+    assert "\t" not in result
+    assert "\r" not in result
+
+
+def test_scrub_body_ignores_empty_secrets():
+    """An empty secret must not splice ``<redacted>`` between every character."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    text = "real secret embedded here and real again"
+
+    result = scrub_body(text, ["", "real"])
+
+    assert "real" not in result
+    assert result.count("<redacted>") == 2
