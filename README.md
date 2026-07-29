@@ -46,9 +46,21 @@ To skip the auto-login (CI / headless), pass `--no-auto-login` and ensure
 |-------------|-------------|
 | **Managed MCP** (UC Functions, Vector Search, Genie, SQL) | `https://<workspace>/api/2.0/mcp/functions/{catalog}/{schema}` |
 | **External MCP** (GitHub, Google Drive, and others) | `https://<workspace>/api/2.0/mcp/external/{connection_name}` |
-| **Apps** (custom MCP servers) | `https://<workspace>.databricks.com/apps/<app>/mcp` |
+| **Apps** (custom MCP servers) | `https://<app-name>-<workspace-id>.<region>.databricksapps.com/<path>` |
 
-> **Apps require OAuth.** Use `--auth-type databricks-cli` when connecting to a Databricks App. Managed and External MCP servers also work with PAT and other auth types.
+An App is served from its own hostname on `databricksapps.com` — **not** from a
+path under your workspace host. Databricks assigns the URL when the app is
+created and it cannot be changed afterwards, so copy it from the **Apps** page
+in the workspace UI (or `databricks apps list`) rather than constructing it by
+hand — on the workspace we tested, the segment Databricks documents as
+`<region>` is the cloud name (`aws`), not a region like `us-east-1`. The
+`<path>` is whatever route the app serves MCP on; `/mcp` is the common
+convention.
+
+> **Apps reject raw personal access tokens.** The App front door requires an
+> OAuth token, so use `--auth-type databricks-cli` (browser-based OAuth U2M)
+> when connecting to a Databricks App. Managed and External MCP servers also
+> work with PAT and other auth types.
 
 ## Usage
 
@@ -167,9 +179,22 @@ Authentication is handled by the [Databricks SDK](https://docs.databricks.com/de
 | Auth type | Managed / External MCP | Apps MCP |
 |-----------|------------------------|----------|
 | `databricks-cli` — token from `~/.databrickscfg` | ✅ | ✅ recommended |
-| `pat` — personal access token | ✅ | ❌ not supported |
-| `oauth-m2m` — service principal | ✅ | ✅ |
+| `pat` — personal access token | ✅ | ❌ rejected [^pat] |
+| `oauth-m2m` — service principal | ✅ | ✅ [^m2m] |
 | OAuth U2M — browser-based login | ✅ | ✅ |
+
+[^pat]: An App rejects a PAT sent as-is, because it requires an OAuth token.
+    That is a statement about the *token*, not about your profile: a PAT can be
+    exchanged for an OAuth token (RFC 8693), which uc-mcp-proxy does not do
+    today. Until it does, PAT users should authenticate with
+    `--auth-type databricks-cli` rather than treating Apps as unreachable.
+
+[^m2m]: Verified against a live App-hosted MCP server: `initialize`,
+    `tools/list`, and `tools/call` all succeed through the proxy with a service
+    principal's `oauth-m2m` credentials. The principal must be granted
+    `CAN_USE` on the app first — without that grant the App answers **401**,
+    not 403, so a missing permission is easy to misread as the auth type being
+    unsupported.
 
 ## Troubleshooting
 
@@ -178,8 +203,8 @@ stderr naming the status, the URL, the profile, and the auth type in use.
 
 | Message | Meaning | Fix |
 |---------|---------|-----|
-| `rejected your credentials (HTTP 401)` | The token was minted locally but the server rejected it — it may have expired, or this profile's identity is not recognized by the target. | Refresh the profile's credentials. For `databricks-cli`, run `databricks auth login --profile <name>`. |
-| `refused this request (HTTP 403)` | Authenticated successfully, but not authorized for this target. | Check your grants on the target. Pointing a `pat` profile at a Databricks App produces this — Apps generally require OAuth U2M. |
+| `rejected your credentials (HTTP 401)` | The token was minted locally but the server rejected it — it may have expired, or this profile's identity is not recognized by the target. | Refresh the profile's credentials. For `databricks-cli`, run `databricks auth login --profile <name>`. Against a Databricks App this also appears when the identity simply lacks `CAN_USE` on the app — check the app's permissions before assuming the credential is bad. |
+| `refused this request (HTTP 403)` | Authenticated successfully, but not authorized for this target. | Check your grants on the target. Pointing a `pat` profile at a Databricks App produces this — Apps reject a raw PAT and need an OAuth token, so use `--auth-type databricks-cli`. |
 | `no MCP endpoint at this URL (HTTP 404)` | The URL is wrong. Not an auth failure. | Check `--url`. |
 | `the MCP session expired server-side (HTTP 404)` | The server no longer recognizes this session. | Restart the MCP client to establish a new session. |
 | `the remote MCP server failed (HTTP 5xx)` | Server-side error, **not** an authentication problem. | Retry; check Databricks service status. |
