@@ -607,3 +607,85 @@ def test_the_exchange_client_never_follows_a_redirect():
         exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
 
     assert hosts == ["test-workspace.cloud.databricks.com"], f"the PAT was re-sent to {hosts}"
+
+
+def test_a_huge_integer_lifetime_does_not_escape_as_a_traceback():
+    """``float()`` raises ``OverflowError`` on a big int, which is neither a
+    ``TypeError`` nor a ``ValueError``.
+
+    JSON puts no bound on an integer literal. Letting this escape would unwind
+    out of a frame whose locals include the PAT and ``form["subject_token"]``,
+    producing exactly the traceback this module exists to replace -- and
+    bypassing ``report_fatal``, so the backstop would re-raise it.
+    """
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.dumps({"access_token": "t", "expires_in": 10**400}).encode()
+        return httpx.Response(200, content=body)
+
+    token = exchange_pat(PAT, make_config(), now=lambda: 1000.0, transport=httpx.MockTransport(handler))
+
+    assert token.expires_at == 1000.0 + 3600 - 60
+
+
+def test_an_absurdly_long_lifetime_is_clamped():
+    """A ten-year token is a malfunction; believing it pins a stale credential."""
+    assert _expires_in_for(315_360_000) == 3600.0
+    assert _expires_in_for(86_400) == 86_400.0  # a full day is still plausible
+
+
+def _expires_in_for(value: object) -> float:
+    from uc_mcp_proxy.token_exchange import _expires_in
+
+    return _expires_in({"expires_in": value})
+
+
+def test_a_compressed_reply_is_refused_rather_than_decoded():
+    """``Accept-Encoding: identity`` is a request, not a control.
+
+    httpx decodes on the *response's* ``Content-Encoding`` regardless of what
+    was asked, and the whole body can arrive as one chunk -- so it expands past
+    the byte cap before any counter in the read loop gets to look at it. 194 KiB
+    on the wire measured 200 MB decoded, on the event-loop thread.
+    """
+    import gzip
+
+    from uc_mcp_proxy.token_exchange import _read_bounded
+
+    payload = gzip.compress(b"A" * 50_000_000)
+
+    class _OneChunk(httpx.SyncByteStream):
+        def __iter__(self):
+            yield payload
+
+    response = httpx.Response(400, headers={"content-encoding": "gzip"}, stream=_OneChunk())
+
+    body = _read_bounded(response, deadline=1e12)
+
+    assert len(body) < 1000, f"decoded {len(body)} bytes despite the refusal"
+    assert "Content-Encoding" in body
+
+
+def test_a_password_in_the_profile_host_is_not_printed():
+    """The SDK preserves userinfo when normalizing the host.
+
+    A ``https://user:password@host`` profile entry would otherwise put that
+    password on stderr, which MCP clients capture to disk.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "no"})
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(
+            PAT,
+            make_config(host="https://someone:hunter2@test-workspace.cloud.databricks.com"),
+            transport=httpx.MockTransport(handler),
+        )
+
+    message = str(excinfo.value)
+    assert "hunter2" not in message
+    assert "someone" not in message
+    # Non-vacuous: the endpoint is still reported, just without the credentials.
+    assert "test-workspace.cloud.databricks.com/oidc/v1/token" in message

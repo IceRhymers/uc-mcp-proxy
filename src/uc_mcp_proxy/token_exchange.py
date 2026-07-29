@@ -52,6 +52,10 @@ _REQUESTED_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 #: round trip in the common case.
 _EXPIRY_MARGIN_SECONDS = 60.0
 _DEFAULT_EXPIRES_IN = 3600
+#: Longest lifetime an endpoint may claim. A token good for a decade is a
+#: malfunction, and believing it would pin a stale credential in the cache for
+#: the life of the process.
+_MAX_EXPIRES_IN = 24 * 3600
 
 #: Hard cap on the token endpoint's reply. The real one is a few hundred
 #: bytes, and this read happens on the event-loop thread.
@@ -186,7 +190,12 @@ def exchange_pat(
                 status = response.status_code
                 reason = scrub_reason(response.reason_phrase or "", [pat])
                 body = _read_bounded(response, deadline)
-    except httpx.RequestError as exc:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Deliberately broad. Every local in this frame is credential-bearing,
+        # so an exception that escapes untranslated becomes a traceback with the
+        # PAT in it rather than a diagnosis. ``RequestError`` alone is narrower
+        # than what a transport can actually raise. Cancellation still
+        # propagates: it derives from ``BaseException``, not ``Exception``.
         raise TokenExchangeError(
             _format_failure(
                 config,
@@ -260,6 +269,14 @@ def _read_bounded(response: httpx.Response, deadline: float) -> str:
     diagnosis; a body that is not valid UTF-8 is itself the finding, and raising
     here would replace a useful message with a decode error.
     """
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in ("", "identity"):
+        # Refused, not decoded. ``Accept-Encoding: identity`` is a request; httpx
+        # decodes on the *response's* header regardless, and a compressed body
+        # expands past the cap inside a single chunk before any byte counter can
+        # look at it -- 194 KiB on the wire became 200 MB in one read. A server
+        # that ignores the request header has nothing useful to say here.
+        return f"(response refused: Content-Encoding {encoding!r}; identity was requested)"
     chunks: list[bytes] = []
     size = 0
     for chunk in response.iter_bytes():
@@ -296,9 +313,14 @@ def _expires_in(payload: dict[str, object]) -> float:
     """
     try:
         seconds = float(payload.get("expires_in", _DEFAULT_EXPIRES_IN))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, ArithmeticError):
+        # ``ArithmeticError`` is not paranoia: JSON has no integer bound, and
+        # ``float(10**400)`` raises ``OverflowError``, which is neither a
+        # ``TypeError`` nor a ``ValueError``. Letting it escape would unwind as
+        # a traceback out of a frame holding the PAT -- the exact outcome this
+        # module exists to prevent.
         return float(_DEFAULT_EXPIRES_IN)
-    if not math.isfinite(seconds) or seconds <= 0:
+    if not math.isfinite(seconds) or not 0 < seconds <= _MAX_EXPIRES_IN:
         return float(_DEFAULT_EXPIRES_IN)
     return seconds
 
@@ -325,9 +347,13 @@ def _format_failure(
     # message is not always the person who wrote the value.
     scope = scrub_body(" ".join(config.scopes), []) if config.scopes else "(omitted -- no --scope given)"
     client_id = scrub_body(config.client_id, [])
+    # Userinfo stripped: the SDK preserves it when normalizing the profile host,
+    # so a ``https://user:password@host`` entry would otherwise put that
+    # password on stderr, which MCP clients capture to disk.
+    shown_endpoint = scrub_body(str(httpx.URL(endpoint).copy_with(userinfo=b"")), [pat])
     lines = [
         f"uc-mcp-proxy: {headline}",
-        f"  endpoint:             {endpoint}",
+        f"  endpoint:             {shown_endpoint}",
         f"  grant_type:           {_GRANT_TYPE}",
         f"  subject_token_type:   {_SUBJECT_TOKEN_TYPE}",
         f"  requested_token_type: {_REQUESTED_TOKEN_TYPE}",

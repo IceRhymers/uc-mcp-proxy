@@ -519,6 +519,12 @@ class HttpErrorReporter:
         consumed but not closed and ``.text`` raises ``ResponseNotRead``, so
         the flag -- not a try around ``.text`` alone -- is what makes this safe.
         """
+        encoding = response.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in ("", "identity"):
+            # See ``token_exchange._read_bounded``: httpx decodes on the
+            # response's header whatever we asked for, and one compressed chunk
+            # can expand three orders of magnitude past the cap.
+            return f"(response refused: Content-Encoding {encoding!r})"
         chunks: list[bytes] = []
         read_ok = False
         with anyio.move_on_after(_BODY_READ_TIMEOUT):
