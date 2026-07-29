@@ -171,6 +171,23 @@ Authentication is handled by the [Databricks SDK](https://docs.databricks.com/de
 | `oauth-m2m` — service principal | ✅ | ✅ |
 | OAuth U2M — browser-based login | ✅ | ✅ |
 
+## Troubleshooting
+
+When the remote MCP server refuses a request, the proxy prints a diagnosis to
+stderr naming the status, the URL, the profile, and the auth type in use.
+
+| Message | Meaning | Fix |
+|---------|---------|-----|
+| `rejected your credentials (HTTP 401)` | The token was minted locally but the server rejected it — it may have expired, or this profile's identity is not recognized by the target. | Refresh the profile's credentials. For `databricks-cli`, run `databricks auth login --profile <name>`. |
+| `refused this request (HTTP 403)` | Authenticated successfully, but not authorized for this target. | Check your grants on the target. Pointing a `pat` profile at a Databricks App produces this — Apps generally require OAuth U2M. |
+| `no MCP endpoint at this URL (HTTP 404)` | The URL is wrong. Not an auth failure. | Check `--url`. |
+| `the MCP session expired server-side (HTTP 404)` | The server no longer recognizes this session. | Restart the MCP client to establish a new session. |
+| `the remote MCP server failed (HTTP 5xx)` | Server-side error, **not** an authentication problem. | Retry; check Databricks service status. |
+
+A failure on the background server→client stream is reported but does not stop
+the proxy: the SDK retries a bounded number of times and then stops, so
+server-initiated messages may be lost while tool calls keep working.
+
 ## Development
 
 ```bash
