@@ -402,38 +402,6 @@ def make_status_error() -> httpx.HTTPStatusError:
     )
 
 
-SWALLOW_CASES = {
-    "bare_http_status_error": lambda: make_status_error(),
-    "group_of_one": lambda: _BaseExceptionGroup("g", [make_status_error()]),
-    "nested_group": lambda: _BaseExceptionGroup("g", [_BaseExceptionGroup("h", [make_status_error()])]),
-}
-
-RERAISE_CASES = {
-    "bare_cancelled": lambda: asyncio.CancelledError(),
-    "bare_keyboard_interrupt": lambda: KeyboardInterrupt(),
-    "bare_system_exit": lambda: SystemExit(),
-    "group_of_cancelled": lambda: _BaseExceptionGroup("g", [asyncio.CancelledError()]),
-    "group_with_value_error": lambda: _BaseExceptionGroup("g", [make_status_error(), ValueError("nope")]),
-    "group_with_cancelled": lambda: _BaseExceptionGroup("g", [make_status_error(), asyncio.CancelledError()]),
-}
-
-
-@pytest.mark.parametrize("factory", SWALLOW_CASES.values(), ids=list(SWALLOW_CASES))
-def test_is_only_http_status_errors_accepts_pure_status_failures(factory):
-    """Groups whose every leaf is an HTTPStatusError may be swallowed."""
-    from uc_mcp_proxy.errors import is_only_http_status_errors
-
-    assert is_only_http_status_errors(factory()) is True
-
-
-@pytest.mark.parametrize("factory", RERAISE_CASES.values(), ids=list(RERAISE_CASES))
-def test_is_only_http_status_errors_rejects_anything_else(factory):
-    """Cancellation, interrupts and mixed groups must reach the caller."""
-    from uc_mcp_proxy.errors import is_only_http_status_errors
-
-    assert is_only_http_status_errors(factory()) is False
-
-
 def test_leaves_flattens_nested_groups():
     """``_leaves`` returns the non-group leaves in order."""
     from uc_mcp_proxy.errors import _leaves
@@ -730,12 +698,17 @@ DIAGNOSED_SWALLOW_CASES = {
     "group_of_status_and_proxy_fatal": lambda: _BaseExceptionGroup(
         "g", [make_status_error(), make_proxy_fatal_error()]
     ),
+    "nested_group": lambda: _BaseExceptionGroup("g", [_BaseExceptionGroup("h", [make_status_error()])]),
 }
 
 DIAGNOSED_RERAISE_CASES = {
     "bare_cancelled": lambda: asyncio.CancelledError(),
+    "bare_keyboard_interrupt": lambda: KeyboardInterrupt(),
+    "bare_system_exit": lambda: SystemExit(),
     "bare_runtime_error": lambda: RuntimeError("boom"),
+    "group_of_cancelled": lambda: _BaseExceptionGroup("g", [asyncio.CancelledError()]),
     "group_with_runtime_error": lambda: _BaseExceptionGroup("g", [make_status_error(), RuntimeError("boom")]),
+    "group_with_cancelled": lambda: _BaseExceptionGroup("g", [make_status_error(), asyncio.CancelledError()]),
     "empty_group": lambda: _EmptyGroupStub(),
 }
 
@@ -823,3 +796,164 @@ def test_scrub_body_ignores_empty_secrets():
 
     assert "real" not in result
     assert result.count("<redacted>") == 2
+
+
+# ---------------------------------------------------------------------------
+# 24: the scrubber cannot be walked around by splitting the secret
+# ---------------------------------------------------------------------------
+
+
+SPLIT_SECRET_CASES = {
+    "nul_byte": "\x00",
+    "escape": "\x1b",
+    "newline": "\n",
+    "tab": "\t",
+    "carriage_return": "\r",
+    "c1_control": "\x85",
+    "zero_width_space": "​",
+    "bidi_override": "‮",
+    "single_space": " ",
+    "run_of_spaces": "   ",
+}
+
+
+@pytest.mark.parametrize("separator", SPLIT_SECRET_CASES.values(), ids=list(SPLIT_SECRET_CASES))
+def test_scrub_body_redacts_a_secret_the_server_split(separator):
+    """A credential echoed with a byte inserted into it must still be redacted.
+
+    This is the whole reason normalization runs before redaction. Redacting
+    first, the inserted byte defeats ``str.replace``, and the control strip that
+    follows then *deletes* it -- reassembling the secret verbatim on its way to
+    the terminal. The proxy would have printed the credential itself.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    split = secret[:14] + separator + secret[14:]
+
+    result = scrub_body(f'{{"error":"rejected {split}"}}', [secret])
+
+    assert secret not in result, f"credential reassembled: {result!r}"
+    assert "<redacted>" in result
+    # Non-vacuous: the surrounding text really did survive, so this is not
+    # passing because the whole body vanished.
+    assert "rejected" in result
+
+
+def test_scrub_body_still_redacts_an_unsplit_secret():
+    """The ordinary case keeps working -- guards against over-fitting to splits."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+
+    assert scrub_body(f"body {secret} end", [secret]) == "body <redacted> end"
+
+
+def test_scrub_body_strips_bidi_and_zero_width_characters():
+    """Characters that reorder the rendered line are removed along with C0/C1.
+
+    They cannot move the cursor, but they can visually detach a ``<redacted>``
+    marker from what it redacts, or render a hostname backwards.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    result = scrub_body("safe ‮ evil ⁦x⁩ ​ ﻿ end", [])
+
+    for char in ("‮", "⁦", "⁩", "​", "﻿"):
+        assert char not in result
+    assert "safe" in result and "end" in result
+
+
+# ---------------------------------------------------------------------------
+# 25: the reason phrase is server-authored too
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_reason_strips_escapes_and_bounds_length():
+    """The status line is as server-controlled as the body, and far longer.
+
+    h11's grammar rejects only NUL and whitespace, so ESC reaches us intact and
+    httpx's ASCII decode preserves it -- and h11 allows 16 KiB of it, where
+    bodies are capped at 500.
+    """
+    from uc_mcp_proxy.errors import scrub_reason
+
+    hostile = "Forbidden\x1b[2K\x1b[1Auc-mcp-proxy: connected OK" + "A" * 500
+
+    result = scrub_reason(hostile)
+
+    assert "\x1b" not in result
+    assert len(result) <= 80
+
+
+@pytest.mark.anyio
+async def test_reported_message_never_carries_an_escape_from_the_reason_phrase(capsys):
+    """End to end: a hostile status line cannot rewrite the terminal.
+
+    Without this the escape defense built for the body snippet is simply walked
+    around -- the headline interpolates the reason phrase directly.
+    """
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    reporter = make_reporter()
+    request = httpx.Request("POST", URL, extensions={_ROLE_KEY: "request"})
+    response = httpx.Response(403, request=request, text="{}")
+    # httpx derives reason_phrase from the status code, so set it directly --
+    # this is the value a real server puts on the wire.
+    response.extensions = dict(response.extensions, reason_phrase=b"Forbidden\x1b[2K\x1b[1AFAKE")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "403" in err
+
+
+# ---------------------------------------------------------------------------
+# 26: the forwarded-identity header must not outlive its origin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_guard_keeps_forwarded_token_on_the_original_origin():
+    """The header survives the hop the user actually asked for."""
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    request = httpx.Request("POST", URL, headers={"X-Forwarded-Access-Token": "tok"})
+    await guard_forwarded_token(request)
+
+    assert request.headers["X-Forwarded-Access-Token"] == "tok"
+
+
+@pytest.mark.anyio
+async def test_guard_drops_forwarded_token_on_a_cross_origin_hop():
+    """A redirect off the target origin must not carry the credential along.
+
+    httpx strips ``Authorization`` on a cross-origin hop but knows nothing about
+    this header, so the foreign origin would otherwise learn a live token *and*
+    learn it in the one case where the real credential was already removed.
+    """
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    # Extensions are copied per hop, so the rebuilt request carries the origin
+    # recorded on the first one -- the same mechanism ``stamp_role`` relies on.
+    redirected = httpx.Request(
+        "GET",
+        "https://elsewhere.example.net/x",
+        headers={"X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(redirected)
+
+    assert "X-Forwarded-Access-Token" not in redirected.headers
+
+
+@pytest.mark.anyio
+async def test_guard_never_raises_on_a_malformed_request():
+    """Request hooks run outside httpx's ``try``; a raise here escapes entirely."""
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    class _Exploding:
+        url = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    await guard_forwarded_token(_Exploding())  # type: ignore[arg-type]

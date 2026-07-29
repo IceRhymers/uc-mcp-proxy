@@ -33,6 +33,7 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification, JSONRPCRequest
 
+from tests.conftest import FAKE_PAT
 from uc_mcp_proxy import __main__ as main
 from uc_mcp_proxy.errors import HttpErrorReporter, _leaves
 
@@ -45,9 +46,6 @@ REDIRECT_URL = "https://example.com/redirected"
 FOREIGN_URL = "https://elsewhere.example.net/mcp"
 #: The token ``mock_workspace_client.config.authenticate()`` hands out.
 BEARER_TOKEN = "test-oauth-token"
-#: Must match ``conftest.FAKE_PAT``. Duplicated rather than imported because a
-#: conftest is not an importable module from here.
-FAKE_PAT = "dapi-fake-pat-DO-NOT-LOG"
 CLIENT_ID = "00000000-1111-2222-3333-444444444444"
 SESSION_ID = "session-secret-0f1e2d"
 PROTOCOL_VERSION = "2025-06-18"
@@ -1028,6 +1026,43 @@ async def test_pat_never_survives_a_cross_origin_redirect(monkeypatch, mock_work
     for request in foreign:
         assert FAKE_PAT not in "".join(request.headers.values())
         assert "x-forwarded-access-token" not in request.headers
+
+
+async def test_oauth_token_never_survives_a_cross_origin_redirect(monkeypatch, mock_workspace_client):
+    """A redirect off the target origin strips the forwarded token for EVERY auth type.
+
+    The `pat` carve-out above is not enough on its own. httpx pops
+    ``Authorization`` on a cross-origin hop but knows nothing about
+    ``X-Forwarded-Access-Token``, so a single 302 from the app would hand a live
+    workspace OAuth token to an origin the user never named -- and hand it over
+    with the real credential already stripped, so the foreign host learns a
+    token it was never sent directly. `databricks-cli` is the auth type the
+    README *recommends* for Apps, so this is the common configuration.
+    """
+    seen: list[httpx.Request] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == URL:
+            return httpx.Response(302, headers={"location": FOREIGN_URL})
+        return httpx.Response(401, json={"error": "refused"})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(responder, monkeypatch, mock_workspace_client) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    same_origin = [r for r in seen if r.url.host == "example.com"]
+    foreign = [r for r in seen if r.url.host == "elsewhere.example.net"]
+
+    # Non-vacuous on both sides: the header really is sent to the intended
+    # origin, and really is gone by the time the hop lands elsewhere.
+    assert same_origin, "the first hop never happened"
+    assert same_origin[0].headers["x-forwarded-access-token"] == BEARER_TOKEN
+    assert foreign, "the cross-origin hop never happened; this test guards nothing"
+    for request in foreign:
+        assert "x-forwarded-access-token" not in request.headers
+        assert BEARER_TOKEN not in "".join(request.headers.values())
 
 
 # ---------------------------------------------------------------------------

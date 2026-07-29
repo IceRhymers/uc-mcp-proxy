@@ -96,6 +96,30 @@ only the response hook can populate the latter.
 > Failures that reach the user through `report_fatal` are the *only* signal on
 > the GET SSE path: the SDK swallows the raised exception and reconnects.
 
+### Printing server-controlled text
+
+`scrub_body` normalizes **before** it redacts, and that order is the opposite of
+the intuitive one. Collapsing and the control strip both *delete* characters, so
+redacting first lets a server hide a credential from `str.replace` by echoing it
+with one byte inserted — and then the strip removes that byte and reassembles
+the secret verbatim on its way to stderr. Redaction only has to precede
+*truncation*, which it still does. A separator-tolerant pass follows, because a
+run of whitespace collapses to a single space rather than vanishing.
+
+Two things are easy to miss here:
+
+- **The body snippet is not the only remote-controlled text.** The status line's
+  reason phrase is equally server-authored — h11's grammar rejects only NUL and
+  whitespace, so ESC survives — and it is interpolated into every headline.
+  `scrub_reason` exists so the escape defense cannot simply be walked around.
+- **`X-Forwarded-Access-Token` outlives its origin unless something stops it.**
+  httpx pops `Authorization` on a cross-origin redirect but knows nothing about
+  our header, so a single 302 would hand a live credential to a foreign host
+  *with the real credential already stripped*. `guard_forwarded_token` is a
+  request hook rather than a check in `_apply_headers` because the auth flow runs
+  once per attempt while redirects are rebuilt beneath it — only a hook sees
+  every hop.
+
 ## Testing
 
 Tests live in `tests/` with two marker categories:

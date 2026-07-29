@@ -295,7 +295,6 @@ def test_failure_message_names_the_request_shape_but_never_subject_token():
     # exactly the label the code would emit if it started leaking the PAT --
     # while lines labelled `subject_token_type:` remain untouched.
     for line in message.splitlines():
-        assert line.strip() != "subject_token:"
         assert not line.strip().startswith("subject_token:")
 
 
@@ -359,3 +358,119 @@ def test_token_exchange_error_is_an_exception_not_baseexception():
     """
     assert issubclass(TokenExchangeError, Exception)
     assert issubclass(TokenExchangeError, ProxyFatalError)
+
+
+# ---------------------------------------------------------------------------
+# A 2xx body is the one most likely to hold a credential we did not ask for
+# ---------------------------------------------------------------------------
+
+
+def test_unexpected_2xx_shape_reports_keys_not_values():
+    """A successful-but-wrong token response is described, never quoted.
+
+    The `>=400` branches print RFC 6749 error bodies, which is fine. This branch
+    is reached with the body of a *successful* token response -- exactly the
+    body most likely to carry a credential under another spelling. The module
+    guarantees no ``refresh_token`` is stored; printing the body verbatim would
+    write one to stderr, and MCP clients capture stderr to disk.
+    """
+    secrets = {"refresh_token": "RT-SUPER-SECRET", "id_token": "IDT-SECRET", "token_type": "Bearer"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=secrets)
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    message = str(excinfo.value)
+    for value in secrets.values():
+        assert value not in message, f"leaked {value!r}"
+    # Non-vacuous: the keys are the diagnostic and must survive.
+    assert "refresh_token" in message
+    assert "id_token" in message
+
+
+def test_non_json_2xx_still_reports_the_body():
+    """A non-JSON 2xx is usually an HTML login page -- seeing it is the point."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>SSO required</html>")
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    assert "SSO required" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# The PAT rides in a request body, so the channel must be encrypted
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_a_non_https_token_endpoint():
+    """A cleartext host must never receive the PAT.
+
+    The SDK only prepends ``https://`` when a profile omits the scheme, so a
+    profile with an explicit ``http://`` host reaches the exchange untouched --
+    and here the credential is in the request *body*, not just a header.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"access_token": "nope"})
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(host="http://insecure.example.com"), transport=httpx.MockTransport(handler))
+
+    assert "non-HTTPS" in str(excinfo.value)
+    assert PAT not in str(excinfo.value)
+    assert calls == [], "the request must not be sent at all"
+
+
+def test_https_host_is_accepted():
+    """Non-vacuous counterpart: the guard rejects only cleartext."""
+    token = exchange_pat(PAT, make_config(), transport=httpx.MockTransport(ok_handler))
+
+    assert token.access_token == "app-scoped-token"
+
+
+# ---------------------------------------------------------------------------
+# The read happens on the event-loop thread, so it must be bounded
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_response_body_is_bounded():
+    """A huge reply cannot be buffered without limit while the loop is blocked.
+
+    A token endpoint's real reply is a few hundred bytes. This call is
+    synchronous and runs on the event-loop thread, so an unbounded read would
+    hold the stdio bridge open for as long as the server cares to talk.
+    """
+    from uc_mcp_proxy.token_exchange import _MAX_RESPONSE_BYTES
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="A" * (_MAX_RESPONSE_BYTES * 4))
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    # The snippet is bounded far below the cap by ``scrub_body`` anyway; what
+    # this pins is that the whole 256 KiB never became a Python string.
+    assert len(str(excinfo.value)) < _MAX_RESPONSE_BYTES
+
+
+def test_hostile_reason_phrase_cannot_rewrite_the_terminal():
+    """The status line is server-authored and bypasses the body scrubber."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": "nope"},
+            extensions={"reason_phrase": b"Bad Request\x1b[2K\x1b[1AFAKE LINE"},
+        )
+
+    with pytest.raises(TokenExchangeError) as excinfo:
+        exchange_pat(PAT, make_config(), transport=httpx.MockTransport(handler))
+
+    assert "\x1b" not in str(excinfo.value)

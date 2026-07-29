@@ -24,6 +24,7 @@ from uc_mcp_proxy.auth import _preflight_authenticate
 from uc_mcp_proxy.errors import (
     HttpErrorReporter,
     arm_retry,
+    guard_forwarded_token,
     is_only_diagnosed_errors,
     set_remediation,
     stamp_role,
@@ -116,7 +117,12 @@ class DatabricksAuth(httpx.Auth):
         #     definition fresher. Expiry is irrelevant and must not be
         #     consulted: re-checking it here is how a dedupe silently stops
         #     deduping and every request pays for an exchange.
-        if cached is not None and stale is not None and cached.access_token != stale:
+        #
+        #     Truthiness, not ``is not None``: an empty ``stale`` means the
+        #     failed attempt carried no Authorization header at all, which
+        #     compares unequal to every cached token and would hand back the
+        #     credential that was just refused, burning the one retry.
+        if cached is not None and stale and cached.access_token != stale:
             return cached.access_token
         # (b) The ordinary cache hit.
         if cached is not None and stale is None and not cached.expired(time.monotonic()):
@@ -173,6 +179,8 @@ class DatabricksAuth(httpx.Auth):
         # the app host.
         request.headers.update({key: value for key, value in headers.items() if key.lower() != "authorization"})
         request.headers["Authorization"] = f"Bearer {token}"
+        # Belt and braces: ``self._exchange`` is fixed at construction, so the
+        # branch above that sets this header cannot have run for this instance.
         request.headers.pop("X-Forwarded-Access-Token", None)
         if not self._shutting_down():
             arm_retry(request, armed=stale is None)
@@ -360,7 +368,10 @@ def _build_http_client(
         timeout=httpx.Timeout(30.0, read=300.0),
         auth=auth,
         transport=transport,
-        event_hooks={"request": [stamp_role], "response": [reporter.on_response]},
+        event_hooks={
+            "request": [stamp_role, guard_forwarded_token],
+            "response": [reporter.on_response],
+        },
     )
 
 

@@ -27,6 +27,7 @@ credential is re-derived from the PAT when it expires.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from uc_mcp_proxy.errors import ProxyFatalError, scrub_body
+from uc_mcp_proxy.errors import ProxyFatalError, scrub_body, scrub_reason
 
 _TOKEN_PATH = "oidc/v1/token"
 _GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -50,6 +51,10 @@ _REQUESTED_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 #: round trip in the common case.
 _EXPIRY_MARGIN_SECONDS = 60.0
 _DEFAULT_EXPIRES_IN = 3600
+
+#: Hard cap on the token endpoint's reply. The real one is a few hundred
+#: bytes, and this read happens on the event-loop thread.
+_MAX_RESPONSE_BYTES = 64 * 1024
 
 
 class TokenExchangeError(ProxyFatalError):
@@ -69,10 +74,15 @@ class ExchangeConfig:
     scopes: tuple[str, ...]
     verify_ssl: bool
     #: Must NOT be copied from ``_build_http_client``'s ``read=300.0``. This
-    #: call is synchronous and runs on the event loop, so the timeout is a hard
-    #: ceiling on how long the whole proxy stops responding. At 10s the worst
-    #: case is a ten-second freeze of the stdio bridge mid-tool-call, which MCP
-    #: clients (30-60s timeouts) survive; at 300s it would look like a hang.
+    #: call is synchronous and runs on the event loop, so every second spent
+    #: here is a second the stdio bridge -- and the abort path with it -- stops
+    #: responding. At 10s a stalled endpoint costs a pause MCP clients (30-60s
+    #: timeouts) survive; at 300s it would look like a hang.
+    #:
+    #: Note this is httpx's *per-operation* timeout, not a total deadline: an
+    #: endpoint that dribbles one byte just inside every window can hold the
+    #: call open indefinitely. ``_MAX_RESPONSE_BYTES`` bounds the payload, but
+    #: a true wall-clock ceiling would need a deadline-enforcing transport.
     timeout: float = 10.0
 
 
@@ -107,6 +117,15 @@ def exchange_pat(
     ``_build_http_client``, and httpx ignores ``verify`` when it is supplied.
     """
     endpoint = _token_endpoint(config.host)
+    # The PAT rides in the request *body* here, so a cleartext endpoint would
+    # put a long-lived full-privilege credential on the wire in the clear. The
+    # SDK only prepends https:// when a profile omits the scheme entirely, so a
+    # profile with an explicit http:// host reaches this untouched.
+    if httpx.URL(endpoint).scheme != "https":
+        raise TokenExchangeError(
+            f"uc-mcp-proxy: refusing to send a personal access token to a non-HTTPS "
+            f"token endpoint ({endpoint}). Fix the profile's host to use https://.\nExiting."
+        )
     form = {
         "grant_type": _GRANT_TYPE,
         "subject_token": pat,
@@ -130,7 +149,13 @@ def exchange_pat(
             timeout=config.timeout,
             transport=transport,
         ) as client:
-            response = client.post(endpoint, data=form, headers={"Authorization": f"Bearer {pat}"})
+            # Streamed so the body can be bounded. A token endpoint's reply is a
+            # few hundred bytes; anything larger is a misconfiguration or
+            # hostile, and this call is holding the event loop while it reads.
+            with client.stream("POST", endpoint, data=form, headers={"Authorization": f"Bearer {pat}"}) as response:
+                status = response.status_code
+                reason = scrub_reason(response.reason_phrase or "")
+                body = _read_bounded(response)
     except httpx.RequestError as exc:
         raise TokenExchangeError(
             _format_failure(
@@ -142,22 +167,19 @@ def exchange_pat(
             )
         ) from exc
 
-    if response.status_code >= 400:
+    if status >= 400:
         raise TokenExchangeError(
             _format_failure(
                 config,
                 endpoint,
                 pat,
-                headline=(
-                    f"the workspace refused the PAT token exchange "
-                    f"(HTTP {response.status_code} {response.reason_phrase or ''})."
-                ),
-                detail=response.text,
+                headline=f"the workspace refused the PAT token exchange (HTTP {status} {reason}).",
+                detail=body,
             )
         )
 
     try:
-        payload = response.json()
+        payload = json.loads(body)
     except ValueError as exc:
         raise TokenExchangeError(
             _format_failure(
@@ -165,19 +187,28 @@ def exchange_pat(
                 endpoint,
                 pat,
                 headline="the workspace token endpoint returned a body that is not JSON.",
-                detail=response.text,
+                detail=body,
             )
         ) from exc
 
     access_token = payload.get("access_token") if isinstance(payload, dict) else None
     if not isinstance(access_token, str) or not access_token:
+        # Key names only, never values. This is the one branch whose body is a
+        # *successful* token response, and a token response is precisely the
+        # body most likely to carry a credential under some other spelling --
+        # ``refresh_token``, ``id_token``. The module's "no refresh_token is
+        # ever stored" guarantee is about the happy path; this branch exists
+        # because the response shape was not what we expected, so printing it
+        # verbatim would write whatever is actually there to stderr, and MCP
+        # clients capture stderr to disk. The keys are the whole diagnostic.
+        shape = ", ".join(sorted(payload)) if isinstance(payload, dict) else type(payload).__name__
         raise TokenExchangeError(
             _format_failure(
                 config,
                 endpoint,
                 pat,
                 headline="the workspace token endpoint returned no access_token.",
-                detail=response.text,
+                detail=f"response contained only these keys: {shape}",
             )
         )
 
@@ -185,6 +216,23 @@ def exchange_pat(
         access_token=access_token,
         expires_at=issued_at + max(_expires_in(payload) - _EXPIRY_MARGIN_SECONDS, 0.0),
     )
+
+
+def _read_bounded(response: httpx.Response) -> str:
+    """Read at most ``_MAX_RESPONSE_BYTES`` of ``response``, decoded leniently.
+
+    ``errors="replace"`` because this text is only ever shown to a human in a
+    diagnosis; a body that is not valid UTF-8 is itself the finding, and raising
+    here would replace a useful message with a decode error.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_bytes():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= _MAX_RESPONSE_BYTES:
+            break
+    return b"".join(chunks)[:_MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
 
 
 def _token_endpoint(host: str) -> str:
@@ -217,14 +265,18 @@ def _format_failure(
     as well as the header, so an endpoint that echoes the offending field back
     would otherwise print it.
     """
-    scope = " ".join(config.scopes) if config.scopes else "(omitted -- no --scope given)"
+    # Scrubbed even though these are CLI-supplied: .mcp.json files are shared,
+    # committed, and pasted out of issue threads, so the person reading this
+    # message is not always the person who wrote the value.
+    scope = scrub_body(" ".join(config.scopes), []) if config.scopes else "(omitted -- no --scope given)"
+    client_id = scrub_body(config.client_id, [])
     lines = [
         f"uc-mcp-proxy: {headline}",
         f"  endpoint:             {endpoint}",
         f"  grant_type:           {_GRANT_TYPE}",
         f"  subject_token_type:   {_SUBJECT_TOKEN_TYPE}",
         f"  requested_token_type: {_REQUESTED_TOKEN_TYPE}",
-        f"  audience:             {config.client_id}",
+        f"  audience:             {client_id}",
         f"  scope:                {scope}",
     ]
     scrubbed = scrub_body(detail, [pat])
