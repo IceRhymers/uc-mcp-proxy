@@ -1362,3 +1362,39 @@ def test_invisible_non_format_characters_cannot_hide_a_secret(codepoint):
 
     assert PAT_LIKE not in result
     assert "<redacted>" in result
+
+
+@pytest.mark.anyio
+async def test_a_compressed_error_body_is_refused_rather_than_decoded():
+    """The proxy's own error-body read has the same exposure as the exchange's.
+
+    httpx decodes on the response's ``Content-Encoding`` whatever was requested,
+    and a whole body can arrive as one chunk -- so it expands past the byte cap
+    before the loop's counter runs at all.
+    """
+    import gzip
+
+    payload = gzip.compress(b"A" * 50_000_000)
+    delivered: list[int] = []
+
+    class _OneChunk(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            delivered.append(1)
+            yield payload
+
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    reporter = make_reporter()
+    # Built directly: ``make_response``'s ``headers`` go on the *request*, and
+    # ``Content-Encoding`` is a property of the response.
+    response = httpx.Response(
+        500,
+        request=httpx.Request("POST", URL, extensions={_ROLE_KEY: "request"}),
+        headers={"content-encoding": "gzip"},
+        stream=_OneChunk(),
+    )
+
+    snippet = await reporter._read_snippet(response)
+
+    assert delivered == [], "the body was read despite the refusal"
+    assert "Content-Encoding" in snippet
