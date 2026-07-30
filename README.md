@@ -59,10 +59,12 @@ convention.
 
 > **Apps reject raw personal access tokens.** The App front door requires an
 > OAuth token. Either use `--auth-type databricks-cli` (browser-based OAuth
-> U2M), or keep your PAT profile and pass `--client-id` so the proxy exchanges
-> the PAT for an app-scoped token — see
+> U2M), or point a PAT profile at the App URL and the proxy exchanges the PAT
+> for an app-scoped token automatically — see
 > [Databricks Apps from a PAT profile](#databricks-apps-from-a-pat-profile).
-> Managed and External MCP servers work with PAT and other auth types as-is.
+> The PAT must be one the exchange accepts (a Lakebox credential, not a classic
+> `dapi…` PAT). Managed and External MCP servers work with PAT and other auth
+> types as-is.
 
 ## Usage
 
@@ -97,36 +99,28 @@ uc-mcp-proxy --url <MCP_SERVER_URL> [--profile <DATABRICKS_PROFILE>] [--auth-typ
 | `--profile` | Databricks CLI profile name (uses default if omitted) |
 | `--auth-type` | Databricks auth type, e.g. `databricks-cli` |
 | `--meta KEY=VALUE` | Meta parameter injected into `tools/call` `_meta` (repeatable) |
-| `--client-id` | App's `oauth2_app_client_id` — enables the RFC 8693 PAT exchange for Databricks Apps |
-| `--scope SCOPE` | OAuth scope for `--client-id` (repeatable; a value may list several space-separated scopes). Optional |
+| `--client-id` | App's `oauth2_app_client_id` — sets the RFC 8693 exchange audience explicitly, skipping auto-discovery |
+| `--pat-exchange` | Force the exchange on a non-App URL and bypass the classic-`dapi`-PAT refusal |
+| `--scope SCOPE` | OAuth scope for the exchange (repeatable; a value may list several space-separated). Overrides discovered scopes |
 | `--no-verify-ssl` | Disable SSL certificate verification (use with caution — see below) |
 
 ## Databricks Apps from a PAT profile
 
 A Databricks App refuses a raw personal access token — its front door wants an
 OAuth token minted *for that app*. Rather than forcing a browser login, the
-proxy can trade your PAT for one (RFC 8693 token exchange) on your behalf.
+proxy trades your PAT for one (RFC 8693 token exchange) on your behalf, and it
+works this out automatically.
 
-Read the two values you need off the app:
-
-```bash
-databricks apps get <app-name> -o json
-```
-
-- `oauth2_app_client_id` → `--client-id`
-- `effective_user_api_scopes` → `--scope` (optional; omit it if the list is empty)
-
-Then point the proxy at the app:
+**The common case needs no exchange flags.** Point a PAT profile at an App URL
+and the proxy detects the App host (`*.databricksapps.com`), looks up the app's
+`oauth2_app_client_id` and `effective_user_api_scopes` from workspace metadata,
+and runs the exchange:
 
 ```bash
 uc-mcp-proxy \
   --url https://<app-name>-<workspace-id>.aws.databricksapps.com/mcp \
-  --profile MY_PAT_PROFILE \
-  --client-id 00000000-1111-2222-3333-444444444444 \
-  --scope "sql dashboards.genie"
+  --profile MY_PAT_PROFILE
 ```
-
-In `.mcp.json`:
 
 ```json
 {
@@ -136,22 +130,38 @@ In `.mcp.json`:
       "args": [
         "uc-mcp-proxy",
         "--url", "https://<app-name>-<workspace-id>.aws.databricksapps.com/mcp",
-        "--profile", "MY_PAT_PROFILE",
-        "--client-id", "00000000-1111-2222-3333-444444444444",
-        "--scope", "sql dashboards.genie"
+        "--profile", "MY_PAT_PROFILE"
       ]
     }
   }
 }
 ```
 
+The credential must be one the exchange accepts. **A Lakebox-generated
+environment credential works; a classic, hand-minted `dapi…` PAT does not** —
+the platform rejects it as an exchange subject. When the proxy sees an App URL
+with a `dapi…` token it refuses up front with that explanation rather than
+leaking the token on a doomed request. See
+[`docs/token-exchange.md`](docs/token-exchange.md) for the evidence.
+
+Overrides, for when detection or discovery is not enough:
+
+- `--client-id <oauth2_app_client_id>` — set the audience explicitly and skip
+  discovery (e.g. the identity cannot list the app). `--scope` then supplies the
+  scopes, since discovery is skipped.
+- `--scope "a b"` — override the discovered scopes. Repeatable.
+- `--pat-exchange` — force the exchange when `--url` is not recognized as an App
+  host, and bypass the classic-PAT refusal. Discovery still fills the client id
+  and scopes unless `--client-id` is given.
+
 Worth knowing:
 
-- **`--client-id` requires a PAT profile.** On any other auth type the proxy
-  exits immediately rather than pretending to work. `DATABRICKS_TOKEN` counts
-  as a PAT.
-- **`--scope` is optional.** Omitted, the proxy sends no scope parameter at
-  all, and says so in the failure message if the exchange is refused.
+- **The exchange requires a PAT profile.** `--client-id` / `--pat-exchange` on
+  any other auth type exit immediately rather than pretending to work.
+  `DATABRICKS_TOKEN` counts as a PAT.
+- **`--scope` is required by real Apps.** An App with declared
+  `effective_user_api_scopes` rejects a scope-less exchange; discovery supplies
+  them automatically, and the proxy warns if it ends up with none to send.
 - **The exchanged token is short-lived** (about an hour) and is re-minted
   automatically, including once in-place if the app rejects it mid-session, so
   long sessions do not need restarting.
@@ -252,15 +262,16 @@ Authentication is handled by the [Databricks SDK](https://docs.databricks.com/de
 | Auth type | Managed / External MCP | Apps MCP |
 |-----------|------------------------|----------|
 | `databricks-cli` — token from `~/.databrickscfg` | ✅ | ✅ recommended |
-| `pat` — personal access token | ✅ | ✅ with `--client-id` [^pat] |
+| `pat` — personal access token | ✅ | ✅ auto-exchange [^pat] |
 | `oauth-m2m` — service principal | ✅ | ✅ [^m2m] |
 | OAuth U2M — browser-based login | ✅ | ✅ |
 
 [^pat]: An App rejects a PAT sent as-is, because it requires an OAuth token.
     That is a statement about the *token*, not about your profile: a PAT can be
-    exchanged for an app-scoped OAuth token (RFC 8693), and passing
-    `--client-id` makes uc-mcp-proxy do exactly that. Without `--client-id` a
-    PAT profile still cannot reach an App. See
+    exchanged for an app-scoped OAuth token (RFC 8693), and uc-mcp-proxy does
+    this automatically when a PAT profile points at an App URL — no
+    `--client-id` needed. The exchange only accepts certain PAT credentials
+    (a Lakebox-generated one, not a classic `dapi…` PAT). See
     [Databricks Apps from a PAT profile](#databricks-apps-from-a-pat-profile).
 
 [^m2m]: Verified against a live App-hosted MCP server: `initialize`,

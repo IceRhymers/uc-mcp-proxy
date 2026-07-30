@@ -51,6 +51,7 @@ def test_default_profile_is_none():
                     no_auto_login=False,
                     client_id=None,
                     scopes=(),
+                    pat_exchange=False,
                 )
 
 
@@ -72,6 +73,7 @@ def test_creates_workspace_client_with_profile():
                     no_auto_login=False,
                     client_id=None,
                     scopes=(),
+                    pat_exchange=False,
                 )
 
 
@@ -97,6 +99,7 @@ def test_creates_workspace_client_with_auth_type():
                 no_auto_login=False,
                 client_id=None,
                 scopes=(),
+                pat_exchange=False,
             )
 
 
@@ -130,6 +133,7 @@ def test_single_meta_parsed_correctly():
                 no_auto_login=False,
                 client_id=None,
                 scopes=(),
+                pat_exchange=False,
             )
 
 
@@ -165,6 +169,7 @@ def test_multiple_meta_parsed_correctly():
                 no_auto_login=False,
                 client_id=None,
                 scopes=(),
+                pat_exchange=False,
             )
 
 
@@ -206,6 +211,7 @@ def test_no_meta_passes_none():
                     no_auto_login=False,
                     client_id=None,
                     scopes=(),
+                    pat_exchange=False,
                 )
 
 
@@ -227,6 +233,7 @@ def test_no_verify_ssl_passes_verify_ssl_false():
                     no_auto_login=False,
                     client_id=None,
                     scopes=(),
+                    pat_exchange=False,
                 )
 
 
@@ -621,6 +628,96 @@ def test_proxy_client_refuses_compressed_responses(mock_workspace_client):
     client = _build_http_client(auth=MagicMock(), verify_ssl=True, reporter=reporter)
 
     assert client.headers["accept-encoding"] == "identity"
+
+
+def test_pat_exchange_flag_reaches_run():
+    """--pat-exchange is passed to run() as pat_exchange=True."""
+    with patch.object(sys, "argv", ["uc-mcp-proxy", "--url", "https://example.com/mcp", "--pat-exchange"]):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+
+                main()
+                _, kwargs = mock_run.call_args
+                assert kwargs["pat_exchange"] is True
+
+
+def test_pat_exchange_defaults_false():
+    """Without the flag, pat_exchange defaults to False."""
+    with patch.object(sys, "argv", ["uc-mcp-proxy", "--url", "https://example.com/mcp"]):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+
+                main()
+                _, kwargs = mock_run.call_args
+                assert kwargs["pat_exchange"] is False
+
+
+def test_scope_with_pat_exchange_is_accepted():
+    """--scope no longer needs --client-id when --pat-exchange is given."""
+    with patch.object(
+        sys,
+        "argv",
+        ["uc-mcp-proxy", "--url", "https://example.com/mcp", "--pat-exchange", "--scope", "sql"],
+    ):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+
+                main()
+                _, kwargs = mock_run.call_args
+                assert kwargs["scopes"] == ("sql",)
+
+
+def test_scope_with_app_url_is_accepted():
+    """--scope is accepted (no --client-id) when --url is a Databricks App host."""
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "uc-mcp-proxy",
+            "--url",
+            "https://mcp-code-search-123.aws.databricksapps.com/mcp",
+            "--scope",
+            "sql",
+        ],
+    ):
+        with patch("uc_mcp_proxy.__main__.run") as mock_run:
+            mock_run.return_value = MagicMock()
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+
+                main()
+                _, kwargs = mock_run.call_args
+                assert kwargs["scopes"] == ("sql",)
+
+
+def test_pat_exchange_with_non_pat_auth_type_exits_before_preflight():
+    """--pat-exchange with an explicit non-pat --auth-type exits before preflight."""
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "uc-mcp-proxy",
+            "--url",
+            "https://example.com/mcp",
+            "--pat-exchange",
+            "--auth-type",
+            "databricks-cli",
+        ],
+    ):
+        with patch("uc_mcp_proxy.__main__._preflight_authenticate") as mock_preflight:
+            with patch("uc_mcp_proxy.__main__.asyncio.run"):
+                from uc_mcp_proxy.__main__ import main
+
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert "--pat-exchange" in str(exc.value)
+                mock_preflight.assert_not_called()
 
 
 def test_exchange_client_refuses_compressed_responses():

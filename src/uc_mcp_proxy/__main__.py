@@ -20,12 +20,19 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest
 
+from uc_mcp_proxy.app_discovery import (
+    AppDiscoveryError,
+    discover_app,
+    is_app_host,
+    looks_like_classic_pat,
+)
 from uc_mcp_proxy.auth import _preflight_authenticate
 from uc_mcp_proxy.errors import (
     HttpErrorReporter,
     arm_retry,
     guard_forwarded_token,
     is_only_diagnosed_errors,
+    scrub_body,
     set_remediation,
     stamp_role,
 )
@@ -391,6 +398,179 @@ def _client_id_requires_pat(auth_type: str | None, profile: str | None) -> str:
     )
 
 
+def _pat_exchange_requires_pat(auth_type: str | None, profile: str | None) -> str:
+    """Diagnosis for ``--pat-exchange`` on a profile that has no PAT to exchange."""
+    return (
+        f"uc-mcp-proxy: --pat-exchange forces RFC 8693 token exchange, which is implemented only "
+        f"for PAT subject tokens. Profile {profile or 'DEFAULT'!r} resolved to "
+        f"auth_type={auth_type or '(auto-detect)'}. Drop --pat-exchange, or use a PAT profile."
+    )
+
+
+def _no_host_for_exchange(flag: str) -> str:
+    """Diagnosis when the exchange is wanted but the profile names no host."""
+    return (
+        f"uc-mcp-proxy: {flag} needs a workspace host to derive the token endpoint, "
+        f"and no host is configured in this profile."
+    )
+
+
+def _classic_pat_on_app_host(profile: str | None, url: str) -> str:
+    """Diagnosis for a classic ``dapi…`` PAT pointed at a Databricks App.
+
+    The refusal is pre-emptive: the exchange endpoint rejects a classic PAT as a
+    subject token, so attempting it wastes a round trip and sends the credential
+    toward the workspace anyway. Never interpolates the token.
+    """
+    host = urlsplit(url).hostname or url
+    return (
+        f"uc-mcp-proxy: --url points at a Databricks App ({host}), but profile {profile or 'DEFAULT'!r} "
+        f"resolved to a classic personal access token (a `dapi…` token). A Databricks App rejects a "
+        f"classic PAT as a token-exchange subject, so it cannot authenticate. Use a Lakebox-generated "
+        f"credential, `--auth-type databricks-cli`, or an oauth-m2m service principal. To attempt the "
+        f"exchange anyway, pass --pat-exchange."
+    )
+
+
+def _app_not_found(url: str) -> str:
+    """Diagnosis when the URL is an App host but no visible app matches it."""
+    host = urlsplit(url).hostname or url
+    return (
+        f"uc-mcp-proxy: --url is a Databricks App ({host}) but no app visible to this identity has a "
+        f"matching URL, so its client id could not be resolved. Pass --client-id (and --scope) "
+        f"explicitly, or confirm this identity can see the app (`databricks apps list`)."
+    )
+
+
+def _forced_exchange_needs_client_id(url: str) -> str:
+    """Diagnosis when ``--pat-exchange`` is forced on a non-App URL with no client id."""
+    return (
+        f"uc-mcp-proxy: --pat-exchange was given but --url ({url}) is not a Databricks App host, so the "
+        f"app client id cannot be discovered. Pass --client-id explicitly."
+    )
+
+
+def _app_discovery_failed(url: str, detail: str) -> str:
+    """Diagnosis when listing apps to resolve a client id failed outright."""
+    return (
+        f"uc-mcp-proxy: could not list Databricks Apps to resolve the client id for {url}: {detail}. "
+        f"Pass --client-id (and --scope) explicitly to skip discovery."
+    )
+
+
+def _resolve_exchange(
+    client: WorkspaceClient,
+    resolved_url: str,
+    *,
+    client_id: str | None,
+    scopes: tuple[str, ...],
+    pat_exchange: bool,
+    verify_ssl: bool,
+) -> ExchangeConfig | None:
+    """Decide whether — and with what parameters — to run the token exchange.
+
+    Returns an ``ExchangeConfig`` to enable the exchange, or ``None`` to send the
+    profile's credential to the target as-is. Raises ``SystemExit`` with a
+    diagnosis for a combination that cannot work. Four inputs steer it: whether a
+    client id was given explicitly, whether the target is an App host, whether
+    the credential is a PAT, and whether ``--pat-exchange`` forces the path.
+
+    Precedence:
+
+    * An explicit ``--client-id`` is authoritative and unchanged from before: it
+      enables the exchange with the given id and scopes and does no discovery.
+    * Otherwise the exchange engages automatically for a PAT profile aimed at an
+      App host, discovering the id and scopes from workspace metadata — unless
+      the credential is a classic ``dapi…`` PAT, which is refused up front
+      because the endpoint would reject it anyway. ``--pat-exchange`` overrides
+      both the App-host requirement and that refusal.
+    """
+    auth_type = client.config.auth_type
+
+    # Explicit --client-id: fully explicit, and the only path before this change.
+    if client_id:
+        if auth_type != "pat":
+            raise SystemExit(_client_id_requires_pat(auth_type, client.config.profile))
+        if not client.config.host:
+            raise SystemExit(_no_host_for_exchange("--client-id"))
+        return ExchangeConfig(
+            host=client.config.host,
+            client_id=client_id,
+            scopes=scopes,
+            verify_ssl=verify_ssl,
+        )
+
+    # The exchange only ever applies to a PAT subject token.
+    if auth_type != "pat":
+        if pat_exchange:
+            raise SystemExit(_pat_exchange_requires_pat(auth_type, client.config.profile))
+        return None
+
+    app_host = is_app_host(resolved_url)
+    # A PAT aimed at a managed/external MCP (workspace host): send it as-is, the
+    # behavior before this feature existed. Only an App host, or an explicit
+    # force, moves us onto the exchange path.
+    if not (app_host or pat_exchange):
+        return None
+
+    pat = _read_pat(client)
+    classic = looks_like_classic_pat(pat)
+    if classic and not pat_exchange:
+        # ``app_host`` is necessarily true here (the non-app/non-forced case
+        # returned above), so this is a classic PAT aimed at an App.
+        raise SystemExit(_classic_pat_on_app_host(client.config.profile, resolved_url))
+    if classic and pat_exchange:
+        print(
+            "warning: this credential looks like a classic `dapi` personal access token, which a "
+            "Databricks App rejects as a token-exchange subject. Proceeding because --pat-exchange "
+            "was given; the exchange will likely fail.",
+            file=sys.stderr,
+        )
+
+    if not client.config.host:
+        raise SystemExit(_no_host_for_exchange("--pat-exchange" if pat_exchange else "the token exchange"))
+
+    try:
+        discovered = discover_app(client, resolved_url)
+    except AppDiscoveryError as exc:
+        raise SystemExit(_app_discovery_failed(resolved_url, scrub_body(str(exc), [pat] if pat else []))) from exc
+
+    if discovered is None:
+        raise SystemExit(_app_not_found(resolved_url) if app_host else _forced_exchange_needs_client_id(resolved_url))
+
+    final_scopes = scopes or discovered.scopes
+    # client_id and scopes are workspace metadata, not secrets: printing them is
+    # what makes an auto-resolved exchange debuggable.
+    print(
+        f"uc-mcp-proxy: using Databricks App {discovered.name!r} for token exchange "
+        f"(client-id {discovered.client_id}, scopes {list(final_scopes) or '(none)'}).",
+        file=sys.stderr,
+    )
+    if not final_scopes:
+        print(
+            "warning: the app declares no user API scopes and none were given with --scope; the "
+            "exchange may be refused with 'must specify at least one valid scope'.",
+            file=sys.stderr,
+        )
+    return ExchangeConfig(
+        host=client.config.host,
+        client_id=discovered.client_id,
+        scopes=final_scopes,
+        verify_ssl=verify_ssl,
+    )
+
+
+def _read_pat(client: WorkspaceClient) -> str:
+    """The bare PAT the profile hands out, for shape detection only.
+
+    Never logged or returned to a caller that prints it. The exchange path reads
+    the credential again per request; this extra read at startup is what lets the
+    proxy refuse a doomed classic PAT before issuing any request.
+    """
+    headers = client.config.authenticate()
+    return headers.get("Authorization", "").removeprefix("Bearer ")
+
+
 async def run(
     url: str,
     profile: str | None = None,
@@ -402,6 +582,7 @@ async def run(
     *,
     client_id: str | None = None,
     scopes: tuple[str, ...] = (),
+    pat_exchange: bool = False,
     exchange_transport: httpx.BaseTransport | None = None,
 ) -> None:
     """Run the proxy: bridge stdio transport to Streamable HTTP with Databricks OAuth.
@@ -409,8 +590,11 @@ async def run(
     ``url`` may be absolute or workspace-relative; relative values are resolved
     against ``client.config.host`` from the Databricks profile.
 
-    ``client_id`` turns on the RFC 8693 exchange: the profile's PAT is traded
-    for a token scoped to that Databricks App. ``scopes`` is optional.
+    The RFC 8693 exchange trades the profile's PAT for a token scoped to a
+    Databricks App. ``client_id`` enables it explicitly with that audience;
+    otherwise it engages automatically for a PAT aimed at an App host, with the
+    id and scopes discovered from workspace metadata (``pat_exchange`` forces
+    that path). See ``_resolve_exchange``.
 
     Raises ``SystemExit`` with a diagnosis when the remote server refuses a
     request the proxy needed to make. ``transport`` and ``exchange_transport``
@@ -434,27 +618,17 @@ async def run(
         auth_type=client.config.auth_type or "(auto-detect)",
     )
 
-    exchange: ExchangeConfig | None = None
-    if client_id:
-        # Authoritative gate. ``main()`` rejects an explicit contradiction
-        # earlier, before a browser can open, but only the constructed client
-        # knows what an unspecified auth_type actually resolved to.
-        if client.config.auth_type != "pat":
-            raise SystemExit(_client_id_requires_pat(client.config.auth_type, client.config.profile))
-        # ``_resolve_url``'s host guard covers a *relative* --url only; an
-        # absolute one returns before it is ever consulted. The token endpoint
-        # is derived from the workspace host either way.
-        if not client.config.host:
-            raise SystemExit(
-                "uc-mcp-proxy: --client-id needs a workspace host to derive the token endpoint, "
-                "and no host is configured in this profile."
-            )
-        exchange = ExchangeConfig(
-            host=client.config.host,
-            client_id=client_id,
-            scopes=scopes,
-            verify_ssl=verify_ssl,
-        )
+    # Authoritative gate: ``main()`` rejects an explicit contradiction earlier,
+    # before a browser can open, but only the constructed client knows what an
+    # unspecified auth_type and URL actually resolved to.
+    exchange = _resolve_exchange(
+        client,
+        resolved_url,
+        client_id=client_id,
+        scopes=scopes,
+        pat_exchange=pat_exchange,
+        verify_ssl=verify_ssl,
+    )
 
     auth = DatabricksAuth(
         client,
@@ -563,10 +737,20 @@ def main() -> None:
         "--client-id",
         default=None,
         help=(
-            "Enable RFC 8693 token exchange for a Databricks App: trade this profile's "
-            "PAT for an app-scoped OAuth token. Pass the app's `oauth2_app_client_id` "
-            "from `databricks apps get <app-name> -o json`. Requires a PAT profile. "
-            "--scope is optional."
+            "Explicitly set the Databricks App `oauth2_app_client_id` for the RFC 8693 "
+            "token exchange, skipping auto-discovery. For a PAT profile aimed at an "
+            "App (*.databricksapps.com) the client id and scopes are discovered "
+            "automatically, so this is only needed to override that. Requires a PAT profile."
+        ),
+    )
+    parser.add_argument(
+        "--pat-exchange",
+        action="store_true",
+        help=(
+            "Force the RFC 8693 token exchange even when --url is not recognized as a "
+            "Databricks App, and bypass the safety refusal for a classic `dapi` PAT. "
+            "The app's client id and scopes are still discovered from workspace metadata "
+            "unless --client-id is given. Requires a PAT profile."
         ),
     )
     parser.add_argument(
@@ -575,9 +759,10 @@ def main() -> None:
         default=[],
         metavar="SCOPE",
         help=(
-            "OAuth scope requested by --client-id, from the app's "
+            "OAuth scope for the token exchange, from the app's "
             "`effective_user_api_scopes`. Repeatable, and a single value may list "
-            "several space-separated scopes. Ignored without --client-id."
+            "several space-separated scopes. Overrides discovered scopes; has no "
+            "effect unless the exchange is active (--client-id, --pat-exchange, or an App URL)."
         ),
     )
     parser.add_argument(
@@ -596,8 +781,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.scope and not args.client_id:
-        print("Error: --scope has no effect without --client-id.", file=sys.stderr)
+    if args.scope and not (args.client_id or args.pat_exchange or is_app_host(args.url)):
+        print(
+            "Error: --scope has no effect without --client-id, --pat-exchange, or a Databricks App URL.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Cheap gate on the flags as typed, so an explicit contradiction is rejected
@@ -605,17 +793,20 @@ def main() -> None:
     # only catches a stated auth_type -- most real PAT profiles name none, and
     # DATABRICKS_TOKEN names none either -- so ``run()`` still holds the
     # authoritative check once the client has resolved.
-    if args.client_id and args.auth_type and args.auth_type != "pat":
-        raise SystemExit(_client_id_requires_pat(args.auth_type, args.profile))
+    if args.auth_type and args.auth_type != "pat":
+        if args.client_id:
+            raise SystemExit(_client_id_requires_pat(args.auth_type, args.profile))
+        if args.pat_exchange:
+            raise SystemExit(_pat_exchange_requires_pat(args.auth_type, args.profile))
 
     if args.no_verify_ssl:
         print(
             "warning: SSL certificate verification is disabled (--no-verify-ssl). Use only in trusted environments.",
             file=sys.stderr,
         )
-        if args.client_id:
+        if args.client_id or args.pat_exchange or is_app_host(args.url):
             print(
-                "warning: with --client-id the PAT is sent in a request BODY to the token "
+                "warning: the token exchange sends the PAT in a request BODY to the token "
                 "endpoint, not only as a header. Disabling verification exposes it to anyone "
                 "who can intercept that connection.",
                 file=sys.stderr,
@@ -641,6 +832,7 @@ def main() -> None:
             no_auto_login=args.no_auto_login,
             client_id=args.client_id,
             scopes=_parse_scopes(args.scope),
+            pat_exchange=args.pat_exchange,
         )
     )
 

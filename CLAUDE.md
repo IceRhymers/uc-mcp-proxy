@@ -38,6 +38,7 @@ Package in `src/uc_mcp_proxy/`:
 - `auth.py` — credential preflight, auto-login, auth-type-specific remediation
 - `errors.py` — HTTP error diagnosis and reporting from the remote server
 - `token_exchange.py` — RFC 8693 exchange of a PAT for an app-scoped OAuth token
+- `app_discovery.py` — App-host / classic-PAT detection and lookup of an app's `oauth2_app_client_id` + scopes from workspace metadata (drives auto-exchange)
 - `__init__.py` — re-exports `DatabricksAuth`
 
 The proxy bridges an MCP stdio transport to a remote Streamable HTTP MCP server, injecting Databricks OAuth tokens on every request via `DatabricksAuth`.
