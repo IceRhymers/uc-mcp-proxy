@@ -14,11 +14,14 @@ wrapped in ``anyio.fail_after`` so a regression fails loudly instead of hanging.
 
 from __future__ import annotations
 
+import functools
+import itertools
 import json
 import os
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -30,6 +33,7 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification, JSONRPCRequest
 
+from tests.conftest import FAKE_PAT
 from uc_mcp_proxy import __main__ as main
 from uc_mcp_proxy.errors import HttpErrorReporter, _leaves
 
@@ -37,8 +41,12 @@ pytestmark = [pytest.mark.unit, pytest.mark.anyio]
 
 URL = "https://example.com/mcp"
 REDIRECT_URL = "https://example.com/redirected"
+#: A redirect target on a *different* origin, so httpx applies its cross-origin
+#: header rules rather than treating the hop as same-site.
+FOREIGN_URL = "https://elsewhere.example.net/mcp"
 #: The token ``mock_workspace_client.config.authenticate()`` hands out.
 BEARER_TOKEN = "test-oauth-token"
+CLIENT_ID = "00000000-1111-2222-3333-444444444444"
 SESSION_ID = "session-secret-0f1e2d"
 PROTOCOL_VERSION = "2025-06-18"
 TIMEOUT = 10
@@ -210,9 +218,9 @@ class _Proxy:
         # file, which is the only shape that can observe it.
         monkeypatch.setattr(main, "_abort", lambda: proxy.aborted.append(True))
 
-    async def _run(self, url: str) -> None:
+    async def _run(self, url: str, **run_kwargs: Any) -> None:
         try:
-            await main.run(url, transport=self.transport)
+            await main.run(url, transport=self.transport, **run_kwargs)
         except SystemExit as exc:
             self.exit = exc
         except Exception as exc:
@@ -235,6 +243,39 @@ class _Proxy:
         await self._to_proxy.aclose()
 
 
+class _ExchangeTransport(httpx.MockTransport):
+    """A token-exchange endpoint that records every request it was asked.
+
+    ``exchange_pat`` builds a *synchronous* ``httpx.Client``, so this is driven
+    through ``handle_request`` rather than the async path the proxy's own
+    transport uses. Counting matters: several invariants here are about how
+    *many* exchanges a scenario costs, not just whether one happened.
+    """
+
+    def __init__(self, responder: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.requests: list[httpx.Request] = []
+
+        def _recording(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return responder(request)
+
+        super().__init__(_recording)
+
+    @property
+    def count(self) -> int:
+        return len(self.requests)
+
+
+def _minting_exchange() -> Callable[[httpx.Request], httpx.Response]:
+    """An exchange endpoint that hands out a fresh, distinguishable token each time."""
+    tokens = itertools.count(1)
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"access_token": f"app-token-{next(tokens)}", "expires_in": 3600})
+
+    return responder
+
+
 @asynccontextmanager
 async def _running(
     responder: Any,
@@ -242,12 +283,13 @@ async def _running(
     workspace_client: Any,
     *,
     url: str = URL,
+    **run_kwargs: Any,
 ) -> Any:
     """Start ``run()`` in the background and yield the driver for it."""
     proxy = _Proxy(responder)
     proxy.install(monkeypatch, workspace_client)
     async with anyio.create_task_group() as tg:
-        tg.start_soon(proxy._run, url)
+        tg.start_soon(functools.partial(proxy._run, url, **run_kwargs))
         await proxy._reporter_ready.wait()
         try:
             yield proxy
@@ -308,7 +350,7 @@ async def test_request_role_failure_exits_cleanly(status, monkeypatch, mock_work
     assert str(status) in err
     assert URL in err
     assert "test-profile" in err
-    assert "pat" in err
+    assert "databricks-cli" in err
     assert err.rstrip().endswith("Exiting.")
 
     assert proxy.reporter is not None
@@ -547,6 +589,486 @@ async def test_echoed_credentials_are_redacted_from_output(monkeypatch, mock_wor
 
 
 # ---------------------------------------------------------------------------
+# 16. The ordering the whole suppression design rests on
+# ---------------------------------------------------------------------------
+
+
+async def test_response_hook_precedes_auth_flow():
+    """httpx runs response hooks BEFORE handing the response to the auth flow.
+
+    Everything about the retry depends on this. Without suppression the reporter
+    reaches the first 401 first and aborts the process before the retry can ever
+    be dispatched, so the retry would be present, correct, and dead.
+
+    It is an httpx *internal*, not a documented contract. ``pyproject.toml``
+    caps httpx below the next minor precisely because of it; this test is the
+    gate for raising that cap. A reordering then shows up as a loud CI failure
+    rather than a feature that silently stops retrying.
+    """
+    order: list[str] = []
+
+    class _Probe(httpx.Auth):
+        async def async_auth_flow(self, request):
+            response = yield request
+            order.append(f"auth:{response.status_code}")
+            if response.status_code == 401:
+                yield request
+
+    async def hook(response: httpx.Response) -> None:
+        order.append(f"hook:{response.status_code}")
+
+    attempts = itertools.count(1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401 if next(attempts) == 1 else 200, json={})
+
+    async with httpx.AsyncClient(
+        auth=_Probe(),
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": [hook]},
+    ) as client:
+        response = await client.post(URL, json={})
+
+    assert response.status_code == 200, "the two-yield retry did not run at all"
+    assert order[:2] == ["hook:401", "auth:401"], f"hook/auth ordering changed: {order}"
+
+
+# ---------------------------------------------------------------------------
+# 17. The exchange recovers a mid-session 401
+# ---------------------------------------------------------------------------
+
+
+async def test_exchange_401_recovers_mid_session(monkeypatch, mock_workspace_client_pat, capsys):
+    """A tool call refused mid-session is retried with a fresh token and survives.
+
+    The scenario the whole feature exists for: the app token expires about an
+    hour in, long after any manual test has finished. Also pins the exchange
+    *count* -- the cache must make this cost one re-mint, not one per request.
+    """
+    exchange = _ExchangeTransport(_minting_exchange())
+    tool_calls = itertools.count(1)
+    tokens_seen: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        if _is_initialize(request):
+            return _initialize_ok()
+        tokens_seen.append(request.headers.get("authorization", ""))
+        if next(tool_calls) == 1:
+            return httpx.Response(401, json={"error": "token expired"})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 2, "result": {}})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            scopes=("sql",),
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.receive()
+            await proxy.send(_request("tools/list", 2))
+            await proxy.receive()  # the retry succeeded, so a result came back
+
+    assert proxy.error is None
+    assert proxy.exit is None, "a recovered 401 must not terminate the proxy"
+    assert proxy.aborted == [], "_abort hard-kills the process; a recovered 401 must never reach it"
+
+    # One lazy exchange at the first request, one re-mint after the 401.
+    assert exchange.count == 2, f"expected exactly one re-exchange, saw {exchange.count} exchanges"
+    # The retry really did carry a different credential -- otherwise this test
+    # would pass even if the cache were handing back the rejected token.
+    assert tokens_seen[0] != tokens_seen[1]
+    assert FAKE_PAT not in "".join(tokens_seen)
+
+    err = capsys.readouterr().err
+    assert err.count("refreshing and retrying once") == 1
+    assert "Exiting." not in err
+    assert "Traceback" not in err
+    assert proxy.reporter is not None
+    assert proxy.reporter.reported == set(), "a suppressed 401 must not consume a dedup slot"
+
+
+# ---------------------------------------------------------------------------
+# 18. A second refusal is permanent
+# ---------------------------------------------------------------------------
+
+
+async def test_second_401_exits_with_the_exchange_remediation(monkeypatch, mock_workspace_client_pat, capsys):
+    """A freshly minted token refused again is fatal, and says what to check.
+
+    The retry is once, never a loop: an app that refuses a token minted seconds
+    ago is telling us about configuration, not expiry.
+    """
+    exchange = _ExchangeTransport(_minting_exchange())
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return httpx.Response(401, json={"error": "not authorized for this app"})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    assert proxy.error is None
+    assert proxy.exit is not None, "a twice-refused credential must terminate the proxy"
+    assert proxy.exit.code == 1
+
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "HTTPStatusError" not in err
+    # The exchange-specific remediation replaced the generic "may have expired"
+    # text, which would be a false statement here: it did not expire.
+    assert "--client-id" in err
+    assert "--scope" in err
+    assert "may have expired" not in err
+    assert err.rstrip().endswith("Exiting.")
+    # Suppressed once, then reported once.
+    assert err.count("refreshing and retrying once") == 1
+    assert err.count("rejected your credentials") == 1
+
+
+# ---------------------------------------------------------------------------
+# 19. Redirect x retry -- the silent-hang guard
+# ---------------------------------------------------------------------------
+
+
+async def test_redirected_exchange_401_is_suppressed_then_diagnosed(monkeypatch, mock_workspace_client_pat, capsys):
+    """POST -> 302 -> 401, retried, -> 302 -> 401 still ends in one diagnosis.
+
+    httpx copies ``extensions`` per redirect hop rather than sharing them, so
+    disarming ``response.request`` -- that hop's discarded snapshot -- instead of
+    the original would leave the rebuilt retry still reading as armed. Both 401s
+    would then be suppressed and the proxy would hang with no output at all,
+    which is strictly worse than the traceback this module replaced.
+    """
+    exchange = _ExchangeTransport(_minting_exchange())
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        if str(request.url) == URL and request.method == "POST":
+            return httpx.Response(302, headers={"location": REDIRECT_URL})
+        return httpx.Response(401, json={"error": "refused after redirect"})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    # The full hop sequence, not just the first two. The redirect really did
+    # happen (POST rewritten to GET), and the retry re-walked the chain from the
+    # original request. Re-yielding ``response.request`` wholesale instead would
+    # give ``["POST", "GET", "GET"]``: the retried tool call re-sent as a
+    # bodyless GET, and -- because httpx strips ``Authorization`` on a
+    # cross-origin hop -- ``_stale_token`` reading back "", which sends ``_token``
+    # into its stale-mismatch branch and hands straight back the token that was
+    # just refused. The retry would then never re-mint anything.
+    assert proxy.transport.methods == ["POST", "GET", "POST", "GET"]
+    assert proxy.exit is not None, "the second 401 must still be diagnosed through a redirect"
+    assert proxy.exit.code == 1
+
+    err = capsys.readouterr().err
+    assert err.count("refreshing and retrying once") == 1
+    assert err.count("rejected your credentials") == 1
+    assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# 20. An exchange the workspace refuses
+# ---------------------------------------------------------------------------
+
+
+async def test_exchange_failure_exits_one_without_traceback(monkeypatch, mock_workspace_client_pat, capsys):
+    """A refused exchange is diagnosed, not raised -- and it does exit non-zero.
+
+    A wrong ``--client-id``, a wrong ``--scope``, and a revoked PAT are this
+    feature's three commonest failures and all three land here. The failure
+    produces no response from the app, so nothing lands in the reporter's
+    ``(role, status)`` set -- which is exactly why the backstop reads
+    ``diagnosed`` instead. Getting that wrong yields either a traceback, or a
+    fatal message followed by exit 0.
+    """
+    exchange = _ExchangeTransport(lambda request: httpx.Response(400, json={"error": "invalid audience"}))
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return _initialize_ok()
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    assert proxy.error is None, f"a non-SystemExit escaped run(): {proxy.error!r}"
+    assert proxy.exit is not None, "a refused exchange must terminate the proxy"
+    assert proxy.exit.code == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == "", "stdout belongs to JSON-RPC framing"
+    err = captured.err
+    assert "Traceback" not in err
+    assert "HTTPStatusError" not in err
+    assert "refused the PAT token exchange" in err
+    assert "--client-id" in err
+    assert "invalid audience" in err
+    assert err.rstrip().endswith("Exiting.")
+    # The credential is in the body of that request as well as its header.
+    assert FAKE_PAT not in err
+    # Printed once, however many in-flight requests re-ran the failing exchange.
+    assert err.count("refused the PAT token exchange") == 1
+
+
+# ---------------------------------------------------------------------------
+# 21. A refused exchange on the background stream stays non-fatal
+# ---------------------------------------------------------------------------
+
+
+async def test_exchange_get_stream_401_warns_without_exiting(monkeypatch, mock_workspace_client_pat):
+    """A 401 the GET stream cannot recover from warns; it does not terminate."""
+    exchange = _ExchangeTransport(_minting_exchange())
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(401, json={"error": "stream refused"})
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        if _is_initialize(request):
+            return _initialize_ok()
+        return httpx.Response(202)
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.receive()
+            await proxy.send(_initialized_notification())
+            assert proxy.reporter is not None
+            await proxy.reporter.wait_for_report()
+            assert proxy.exit is None, "a stream failure must not terminate the proxy"
+
+    assert proxy.exit is None
+    assert proxy.aborted == []
+    assert proxy.error is None
+
+    (message,) = proxy.reporter.emitted
+    assert "401" in message
+    assert "The proxy will keep running" in message
+    assert "Exiting." not in message
+
+    # Bounded by the SDK's own MAX_RECONNECTION_ATTEMPTS = 2, so the reconnect
+    # loop cannot amplify the exchange without bound. Asserted rather than
+    # enforced by proxy-side state: a test fails loudly if the SDK raises that
+    # constant, where a guard flag would silently absorb the change.
+    assert exchange.count <= 3, f"reconnects amplified the exchange to {exchange.count}"
+
+
+# ---------------------------------------------------------------------------
+# 22. A refused exchange during teardown is not the user's problem
+# ---------------------------------------------------------------------------
+
+
+async def test_teardown_exchange_failure_is_silent_and_exits_zero(monkeypatch, mock_workspace_client_pat, capsys):
+    """A session that outlived its token exits zero even if the last refresh fails.
+
+    The SDK's teardown DELETE goes out through the same auth flow, so a
+    multi-hour session reaches an expired cache on the way out. Network gone,
+    laptop sleeping, VPN dropped -- all ordinary at shutdown. Reporting it would
+    make a clean session exit 1 over a token it never needed, which is what this
+    module already says about a refused teardown: the user did not ask for it,
+    and a server that refuses it has not harmed a session that already ended.
+    """
+    attempts = itertools.count(1)
+
+    def exchange_responder(request: httpx.Request) -> httpx.Response:
+        if next(attempts) == 1:
+            # A positive lifetime below the 60s renewal margin, so the cache is
+            # stale the moment it is written and teardown is forced to re-mint.
+            # Not ``0``: that is clamped to the default, because a zero or
+            # negative lifetime would otherwise cost one blocking exchange per
+            # request rather than one per hour.
+            return httpx.Response(200, json={"access_token": "app-token-1", "expires_in": 1})
+        return httpx.Response(400, json={"error": "workspace unreachable"})
+
+    exchange = _ExchangeTransport(exchange_responder)
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return _initialize_ok()
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.receive()
+
+    assert proxy.exit is None, "a teardown-time exchange failure must not fail the run"
+    assert proxy.aborted == []
+    assert proxy.error is None
+    assert proxy.reporter is not None
+    assert proxy.reporter.shutting_down is True
+    assert proxy.reporter.fatal_message is None
+    assert exchange.count >= 2, "teardown never re-minted; the silence is untested"
+
+    assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# 23. The forwarded-token rule, both directions
+# ---------------------------------------------------------------------------
+
+
+async def test_exchange_path_sends_no_forwarded_token(monkeypatch, mock_workspace_client_pat):
+    """On the exchange path the app gets no client-supplied forwarded token.
+
+    Asserted against requests the real SDK produced, and on every header value
+    rather than one named key, so renaming the header cannot defeat it.
+    """
+    exchange = _ExchangeTransport(_minting_exchange())
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return _initialize_ok()
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(
+            responder,
+            monkeypatch,
+            mock_workspace_client_pat,
+            client_id=CLIENT_ID,
+            exchange_transport=exchange,
+        ) as proxy:
+            await proxy.send(_initialize())
+            await proxy.receive()
+
+    assert proxy.transport.requests, "no request was captured; the assertion would be vacuous"
+    for request in proxy.transport.requests:
+        assert "x-forwarded-access-token" not in request.headers
+        assert FAKE_PAT not in "".join(request.headers.values())
+
+
+async def test_non_pat_profile_still_forwards_the_token(monkeypatch, mock_workspace_client):
+    """For non-``pat`` auth types the forwarded header is byte-identical to before.
+
+    The counterpart that keeps the rule above from being a blanket removal: only
+    PAT profiles lose this header, and that difference is deliberate.
+    """
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return _initialize_ok()
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(responder, monkeypatch, mock_workspace_client) as proxy:
+            await proxy.send(_initialize())
+            await proxy.receive()
+
+    first = proxy.transport.requests[0]
+    assert first.headers["authorization"] == f"Bearer {BEARER_TOKEN}"
+    assert first.headers["x-forwarded-access-token"] == BEARER_TOKEN
+
+
+async def test_pat_never_survives_a_cross_origin_redirect(monkeypatch, mock_workspace_client_pat):
+    """A redirect to a foreign origin carries no PAT, in any header.
+
+    httpx strips ``Authorization`` on a cross-origin hop but strips no header of
+    ours, so mirroring the credential into a second header would hand the PAT to
+    the new origin with the real credential already removed. Omitting it for
+    every ``pat`` profile -- not only on the exchange path -- is what closes that.
+    """
+    seen: list[httpx.Request] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == URL:
+            return httpx.Response(302, headers={"location": FOREIGN_URL})
+        return httpx.Response(401, json={"error": "refused"})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(responder, monkeypatch, mock_workspace_client_pat) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    foreign = [request for request in seen if request.url.host == "elsewhere.example.net"]
+    assert foreign, "the cross-origin hop never happened; this test guards nothing"
+    for request in foreign:
+        assert FAKE_PAT not in "".join(request.headers.values())
+        assert "x-forwarded-access-token" not in request.headers
+
+
+async def test_oauth_token_never_survives_a_cross_origin_redirect(monkeypatch, mock_workspace_client):
+    """A redirect off the target origin strips the forwarded token for EVERY auth type.
+
+    The `pat` carve-out above is not enough on its own. httpx pops
+    ``Authorization`` on a cross-origin hop but knows nothing about
+    ``X-Forwarded-Access-Token``, so a single 302 from the app would hand a live
+    workspace OAuth token to an origin the user never named -- and hand it over
+    with the real credential already stripped, so the foreign host learns a
+    token it was never sent directly. `databricks-cli` is the auth type the
+    README *recommends* for Apps, so this is the common configuration.
+    """
+    seen: list[httpx.Request] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == URL:
+            return httpx.Response(302, headers={"location": FOREIGN_URL})
+        return httpx.Response(401, json={"error": "refused"})
+
+    with anyio.fail_after(TIMEOUT):
+        async with _running(responder, monkeypatch, mock_workspace_client) as proxy:
+            await proxy.send(_initialize())
+            await proxy.finished.wait()
+
+    same_origin = [r for r in seen if r.url.host == "example.com"]
+    foreign = [r for r in seen if r.url.host == "elsewhere.example.net"]
+
+    # Non-vacuous on both sides: the header really is sent to the intended
+    # origin, and really is gone by the time the hop lands elsewhere.
+    assert same_origin, "the first hop never happened"
+    assert same_origin[0].headers["x-forwarded-access-token"] == BEARER_TOKEN
+    assert foreign, "the cross-origin hop never happened; this test guards nothing"
+    for request in foreign:
+        assert "x-forwarded-access-token" not in request.headers
+        assert BEARER_TOKEN not in "".join(request.headers.values())
+
+
+# ---------------------------------------------------------------------------
 # The proxy must actually terminate -- observable only from outside the process
 # ---------------------------------------------------------------------------
 
@@ -648,7 +1170,7 @@ def test_proxy_process_exits_on_401_with_stdin_still_open():
 async def test_unrelated_exception_is_not_swallowed_by_the_backstop(monkeypatch, mock_workspace_client, capsys):
     """``except BaseException`` is the riskiest construct here -- pin the re-raise.
 
-    ``is_only_http_status_errors`` is tested exhaustively as a predicate, but
+    ``is_only_diagnosed_errors`` is tested exhaustively as a predicate, but
     nothing otherwise exercises the wiring that keeps a genuine bug (or a
     Ctrl-C) from being swallowed and misreported as a credential rejection.
     """

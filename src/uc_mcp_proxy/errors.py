@@ -22,14 +22,48 @@ request was for. ``stamp_role`` records the role on the way out instead.
 from __future__ import annotations
 
 import contextlib
+import functools
+import re
 import sys
+import unicodedata
+from collections.abc import Sequence
 
 import anyio
 import httpx
 
+
+class ProxyFatalError(Exception):
+    """A proxy-side failure that has already been diagnosed to stderr.
+
+    Raised only after the diagnosis has been emitted, so the backstop in
+    ``__main__`` may swallow it: re-raising would print a traceback whose only
+    new information is a line number.
+
+    Derives from ``Exception``, never ``BaseException``, and that choice is
+    load-bearing in two places inside the MCP SDK. ``_handle_get_stream``
+    catches ``except Exception`` and reconnects, so a failure on the background
+    stream stays non-fatal; ``terminate_session`` catches ``except Exception``
+    so a failure during teardown cannot turn a clean shutdown into a crash. A
+    ``BaseException`` here would slip past both and invert the request-vs-stream
+    fatality rule this module exists to encode.
+    """
+
+
 _BODY_SNIPPET_LIMIT = 500
+#: Reason phrases are a handful of words; h11 would allow 16 KiB of them.
+_REASON_LIMIT = 80
 _BODY_READ_TIMEOUT = 5.0
 _ROLE_KEY = "uc_mcp_role"
+#: The origin of the first hop, so a redirect that leaves it can be detected.
+_ORIGIN_KEY = "uc_mcp_origin"
+
+#: Set on a request whose 401 the auth layer will retry. Mechanical on purpose:
+#: this module never learns *why* a retry is pending, only that one is, so the
+#: same machinery serves any future credential-refresh path.
+_RETRY_KEY = "uc_mcp_retry_armed"
+#: Proxy-authored remediation text for a 401/403 on this request. Authored here
+#: in the proxy, never by the server, so it needs no scrubbing.
+_REMEDIATION_KEY = "uc_mcp_remediation"
 
 #: JSON-RPC requests and notifications. The channel the user's tool calls ride
 #: on -- a refusal here is fatal.
@@ -51,12 +85,71 @@ _METHOD_ROLES = {
 # inside a server error body.
 _SECRET_HEADERS = ("X-Forwarded-Access-Token", "mcp-session-id")
 
-#: C0 and C1 control characters, deleted from the body snippet.
-#: That snippet is the only remote-controlled text the proxy prints, and it
-#: prints to a terminal. Collapsing whitespace does not remove ESC, so without
-#: this a server could emit cursor-movement and erase sequences that overwrite
-#: the diagnosis above it with text of its own choosing.
-_CONTROL_CHARS = dict.fromkeys([*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0)])
+#: What a redacted secret is replaced with.
+_REDACTED = "<redacted>"
+
+#: Cap on how much of a remote body is buffered before it is scrubbed. The
+#: snippet the user sees is only ``_BODY_SNIPPET_LIMIT``; this bounds what the
+#: proxy holds in memory to get there, so a server cannot make it buffer
+#: gigabytes to produce a few hundred characters.
+_MAX_SNIPPET_BYTES = 64 * 1024
+
+#: Above this, a secret is matched literally rather than as an interleaved
+#: pattern. A server picks the length of ``mcp-session-id``, so the cost has to
+#: be bounded somewhere -- but the bound sits far above any credential this
+#: proxy handles. An OIDC JWT runs several hundred characters (an RS256
+#: signature alone is 342 base64url characters), and a token that fell through
+#: to exact matching would lose separator tolerance entirely.
+_MAX_PATTERN_CHARS = 4096
+
+#: Shortest surviving fragment of a severed secret still worth redacting.
+#: Below this the fragment carries little and false positives would start
+#: mangling ordinary text at the tail of a snippet.
+_MIN_PARTIAL_SECRET = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _control_chars() -> dict[int, None]:
+    """Every character deleted from remote-controlled text before it is printed.
+
+    Derived from Unicode categories rather than enumerated by hand. An
+    enumerated list was wrong twice: it is not enough to strip the escapes that
+    move a cursor (``Cc``), because the invisible formatting characters
+    (``Cf`` -- soft hyphen, word joiner, the bidi controls, the tag block) let a
+    server sit one of them between every character of a credential. That
+    defeats an exact-match redactor while still *rendering* as the bare secret
+    to anyone reading the log. Categories close the class; a list closes
+    whichever members somebody thought of.
+
+    Whitespace-like control characters (tab, newline, the C0 separators) are
+    excluded so that the *collapse* handles them. Deleting them here instead
+    would run words together, and -- far worse -- it would let a deletion
+    re-create a whitespace run after the collapse had already normalized one
+    away, which is the property the redactor's regex depends on being
+    impossible.
+
+    Built lazily and cached -- the scan is ~100ms, and it is only ever needed
+    on a path that is already about to print a diagnosis.
+    """
+    return dict.fromkeys(
+        [
+            *(
+                cp
+                for cp in range(sys.maxunicode + 1)
+                if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+            ),
+            # Blank in every terminal but not ``Cf``, so the category test above
+            # misses them: the Hangul fillers are ``Lo`` and the braille blank
+            # is ``So``. Categories close most of the class; these are the
+            # documented residue. ``scrub_body`` states the honest limit -- this
+            # is defence in depth, not a guarantee.
+            0x115F,  # HANGUL CHOSEONG FILLER
+            0x1160,  # HANGUL JUNGSEONG FILLER
+            0x3164,  # HANGUL FILLER
+            0xFFA0,  # HALFWIDTH HANGUL FILLER
+            0x2800,  # BRAILLE PATTERN BLANK
+        ]
+    )
 
 
 async def stamp_role(request: httpx.Request) -> None:
@@ -80,6 +173,217 @@ async def stamp_role(request: httpx.Request) -> None:
         )
 
 
+async def guard_forwarded_token(request: httpx.Request) -> None:
+    """Drop credential headers on any hop that leaves the first origin.
+
+    httpx pops ``Authorization`` when a redirect crosses origins but knows
+    nothing about this header, so without this a single ``302`` hands a live
+    workspace credential to a host the user never named -- and hands it over
+    *with the real ``Authorization`` header already stripped*, so the foreign
+    origin learns a token it was never sent directly.
+
+    First-wins on the origin, for the same reason ``stamp_role`` is first-wins
+    and by the same mechanism: httpx copies ``extensions`` per hop, so the value
+    recorded on the first request is carried into every rebuilt one. The first
+    hop is by definition the target the user asked for.
+
+    A request hook rather than a check in ``_apply_headers``, because the auth
+    flow runs once per attempt while redirects are rebuilt beneath it -- only a
+    hook sees every hop.
+    """
+    # Two properties at once, and the structure is what gets both.
+    #
+    # Never raises: a request hook is invoked outside httpx's own ``try``, so
+    # an exception here escapes without even closing the response.
+    #
+    # Fails *closed*: the headers come off first and go back on only once the
+    # origin has been confirmed to match, so anything unexpected in between
+    # leaves them off. A blanket suppress is right for ``stamp_role``, where
+    # failing open merely loses a label; here failing open would hand a live
+    # credential to a foreign origin.
+    with contextlib.suppress(Exception):
+        carried = {name: request.headers.pop(name) for name in _SECRET_HEADERS if name in request.headers}
+        if not carried:
+            return
+        origin = (request.url.scheme, request.url.host, request.url.port)
+        if request.extensions.setdefault(_ORIGIN_KEY, origin) == origin:
+            request.headers.update(carried)
+
+
+def arm_retry(request: httpx.Request, *, armed: bool) -> None:
+    """Record whether a 401 on ``request`` will be retried by the auth layer.
+
+    Assigns unconditionally, unlike ``stamp_role``'s ``setdefault``. The two
+    keys want opposite semantics on the same dict and the difference is easy to
+    get backwards, so ``armed`` is keyword-only to make the transition visible
+    at every call site: a role is an immutable property of the logical
+    operation and must survive a redirect rewrite, while the retry marker is a
+    property of the current attempt and must flip ``True`` -> ``False`` when
+    the retry itself goes out.
+
+    Callers must pass the *original* request, never ``response.request``. Under
+    a redirect the latter is that hop's snapshot -- httpx copies extensions per
+    hop rather than sharing them -- so disarming it would write into a dict
+    that is then discarded, the rebuilt retry would still read as armed, both
+    401s would be suppressed, and the proxy would hang with no diagnosis at all.
+    """
+    with contextlib.suppress(Exception):
+        request.extensions[_RETRY_KEY] = armed
+
+
+def retry_armed(request: httpx.Request) -> bool:
+    """True if a 401 on ``request`` is about to be retried."""
+    return bool(request.extensions.get(_RETRY_KEY, False))
+
+
+def set_remediation(request: httpx.Request, text: str) -> None:
+    """Attach proxy-authored remediation text for a 401/403 on ``request``."""
+    with contextlib.suppress(Exception):
+        request.extensions[_REMEDIATION_KEY] = text
+
+
+def remediation(request: httpx.Request) -> str | None:
+    """Return the proxy-authored remediation for ``request``, if any."""
+    text = request.extensions.get(_REMEDIATION_KEY)
+    return text if isinstance(text, str) else None
+
+
+def _normalize(text: str) -> str:
+    """Strip invisible characters, then flatten whitespace runs to one space.
+
+    Both halves of every comparison go through this, so a credential echoed
+    with something hidden inside it lands in the same shape as the needle.
+
+    The order is the load-bearing part: stripping *after* collapsing would let
+    a deletion re-create a whitespace run the collapse had already flattened,
+    and the redactor's pattern is only free of ambiguity because no such run
+    can exist.
+    """
+    return " ".join(text.translate(_control_chars()).split())
+
+
+def scrub_body(text: str, secrets: Sequence[str]) -> str:
+    """Return ``text`` safe to print: normalized, then secrets removed, then bounded.
+
+    The step order is load-bearing, and it is not the intuitive one.
+
+    Normalization runs **first**. Collapsing and the control strip both *delete*
+    characters, so redacting ahead of them lets a server defeat ``str.replace``
+    by echoing the credential with one byte inserted into the middle of it --
+    and then this function removes that byte and reassembles the secret
+    verbatim on its way to the terminal. Redacting first buys nothing: the
+    property that matters, that a secret straddling the truncation boundary is
+    never half-printed, only requires redaction to precede *truncation*, which
+    it still does.
+
+    Secret-agnostic so the token-exchange path, whose request carries a
+    credential in the body as well as the header, shares this one
+    implementation of the terminal-escape defense rather than growing a second.
+
+    This is defence in depth against a server that echoes back what it was
+    sent, and it is bounded by what a *cooperative* mistake looks like. It is
+    not a guarantee against a hostile server: anything able to echo a
+    credential already holds that credential, and could simply keep it. The
+    controls that actually contain a credential are the ones that stop it being
+    sent -- the ``pat`` carve-out on ``X-Forwarded-Access-Token``, the
+    cross-origin guard, and the HTTPS floor on the token endpoint.
+    """
+    return _redact(_normalize(text), secrets)[:_BODY_SNIPPET_LIMIT]
+
+
+def _redact(text: str, secrets: Sequence[str]) -> str:
+    """Replace every occurrence of every secret in ``text``.
+
+    Every span is located against the text as passed in, and the splice happens
+    once at the end. Redacting secrets one after another instead -- each one
+    searching the string the previous one already rewrote -- is not merely
+    untidy: ``mcp-session-id`` is chosen by the server and bounded by nothing,
+    so a server can craft one that overlaps the real credential by a single
+    character, have it replaced first, and destroy the real credential's own
+    match. Order-independence is the property that closes that, and applying
+    the longest secret first is not a substitute for it.
+    """
+    spans: list[tuple[int, int]] = []
+    for secret in secrets:
+        needle = _normalize(secret)
+        if not needle:
+            continue
+        spans.extend(_spans_for(text, needle))
+    if not spans:
+        return text
+
+    out: list[str] = []
+    last = 0
+    for lo, hi in _merged(spans):
+        out.append(text[last:lo])
+        out.append(_REDACTED)
+        last = hi
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _spans_for(text: str, needle: str) -> list[tuple[int, int]]:
+    """Where ``needle`` occurs in ``text``, tolerating an inserted separator."""
+    if " " in needle or len(needle) > _MAX_PATTERN_CHARS:
+        # An interleaved pattern built from a needle that itself contains
+        # whitespace is ambiguous at every space, and one built from an
+        # enormous needle costs time the server would be choosing. Both are
+        # only reachable via ``mcp-session-id``, which no real credential
+        # resembles, so exact matching is the right trade there -- and the cap
+        # sits well above any token this proxy handles, because an OIDC JWT is
+        # several hundred characters and must NOT fall through to it.
+        found = []
+        at = text.find(needle)
+        while at != -1:
+            found.append((at, at + len(needle)))
+            at = text.find(needle, at + 1)
+        matches = found
+    else:
+        # ``\s?``: the collapse in ``_normalize`` ran last, so no whitespace run
+        # longer than one survives, and the needle holds none at all.
+        pattern = re.compile(r"\s?".join(map(re.escape, needle)))
+        matches = [match.span() for match in pattern.finditer(text)]
+
+    # The callers stop reading at a byte cap that can land inside a credential.
+    # What survives is a prefix at the very end, matching nothing above. Reading
+    # further is not a fix -- the next cap has the same edge.
+    for length in range(len(needle) - 1, _MIN_PARTIAL_SECRET - 1, -1):
+        if text.endswith(needle[:length]):
+            matches.append((len(text) - length, len(text)))
+            break
+    return matches
+
+
+def _merged(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Overlapping spans coalesced, so one redaction cannot split another."""
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def scrub_reason(reason: str, secrets: Sequence[str] = ()) -> str:
+    """Return an HTTP reason phrase safe to interpolate into a diagnosis.
+
+    The reason phrase is as server-authored as the body and reaches us intact:
+    h11's grammar rejects only NUL and whitespace, so ESC passes validation and
+    httpx's ASCII decode preserves it. Every headline in this module
+    interpolates it, so without this the escape defense built for the body
+    snippet is simply walked around -- and unlike the body, the status line is
+    bounded only by h11's 16 KiB header limit.
+
+    ``secrets`` is not optional in spirit. Stripping escapes without redacting
+    leaves a channel that prints a credential *in full*, on the line directly
+    above a body the same function successfully protected: a server answering
+    ``403 Forbidden token=<the token it just received>`` needs no positioning
+    and no padding to do it.
+    """
+    return scrub_body(reason, secrets)[:_REASON_LIMIT]
+
+
 class HttpErrorReporter:
     """Reports HTTP failures from the remote MCP server and signals shutdown.
 
@@ -99,6 +403,48 @@ class HttpErrorReporter:
         self.last_message: str | None = None
         self.reported: set[tuple[str, int]] = set()
         self.shutting_down = False
+
+    @property
+    def diagnosed(self) -> bool:
+        """True once any diagnosis has reached stderr, from either entrance.
+
+        ``reported`` is keyed on ``(role, status)`` and only ``_report`` can
+        populate it, so a proxy-side failure -- which has no response and
+        therefore neither a role nor a status -- would leave it empty. The
+        backstop in ``__main__`` reads this instead, so both entrances answer
+        the one question it actually asks: has the user already been told?
+        """
+        return bool(self.reported) or self.fatal_message is not None
+
+    def report_fatal(self, message: str) -> None:
+        """Report a proxy-side failure that has no server response behind it.
+
+        The second entrance into this class. ``_report`` is driven by httpx's
+        response hook and keys everything off an ``httpx.Response``; this one is
+        called by the auth layer when the *proxy* failed instead of the server.
+        Both must leave this object in the same state and obey the same guards,
+        because ``run()`` reads only that state.
+
+        Returns early while shutting down, symmetric with ``_report``. The SDK's
+        teardown DELETE goes out through the same auth flow, so on a session
+        that outlived its token this can be reached by an exchange the user
+        never asked for; a clean multi-hour session must not exit non-zero
+        because a credential refresh failed on the way out the door.
+
+        On the background GET stream the SDK swallows the raised failure into
+        ``logger.debug`` and reconnects, so this print is the *only* signal the
+        user ever gets. It is not redundant with the raise.
+        """
+        if self.shutting_down:
+            return
+        # Idempotent: every in-flight request re-runs the failing refresh, and
+        # the user needs the diagnosis once, not once per request.
+        if self.fatal_message is not None:
+            return
+        print(message, file=sys.stderr)
+        self.last_message = message
+        self.fatal_message = message
+        self.fatal.set()
 
     async def on_response(self, response: httpx.Response) -> None:
         """httpx ``response`` event hook. Never raises except on cancellation."""
@@ -120,6 +466,23 @@ class HttpErrorReporter:
         # holds even if a future SDK deletes at some other moment.
         if role == ROLE_TEARDOWN:
             return  # pragma: no cover
+        if response.status_code == 401 and retry_armed(response.request):
+            # The auth layer re-mints the credential and retries this exactly
+            # once. Reporting here would set ``fatal_message`` and fire
+            # ``fatal``, and ``_watch_fatal`` would ``_abort()`` the process
+            # before the retry was ever dispatched -- httpx runs response event
+            # hooks strictly before it hands the response back to the auth flow.
+            #
+            # Returning here, rather than after the dedup check below, is
+            # deliberate on both sides: nothing is added to ``reported``, so a
+            # suppressed 401 neither consumes the ``(role, status)`` slot the
+            # real report will need nor makes ``diagnosed`` true; and the body
+            # is left unread, so httpx can still consume it on the way back up.
+            print(
+                "uc-mcp-proxy: credential rejected (401); refreshing and retrying once.",
+                file=sys.stderr,
+            )
+            return
         key = (role, response.status_code)
         if key in self.reported:
             return
@@ -156,34 +519,48 @@ class HttpErrorReporter:
         consumed but not closed and ``.text`` raises ``ResponseNotRead``, so
         the flag -- not a try around ``.text`` alone -- is what makes this safe.
         """
+        encoding = response.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in ("", "identity"):
+            # See ``token_exchange._read_bounded``: httpx decodes on the
+            # response's header whatever we asked for, and one compressed chunk
+            # can expand three orders of magnitude past the cap.
+            return f"(response refused: Content-Encoding {encoding!r})"
+        chunks: list[bytes] = []
         read_ok = False
         with anyio.move_on_after(_BODY_READ_TIMEOUT):
-            await response.aread()
+            # Bounded, not ``aread()``. The timeout alone caps how *long* a
+            # server can talk, which on a fast link is still hundreds of
+            # megabytes buffered to produce a few hundred printed characters.
+            size = 0
+            async for chunk in response.aiter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                # Both the decoded size and the wire size. ``Accept-Encoding:
+                # identity`` is a request; a server may compress anyway, and
+                # httpx decodes on the *response's* header regardless of what
+                # was asked, so one chunk can decode far past the cap.
+                if size >= _MAX_SNIPPET_BYTES or response.num_bytes_downloaded >= _MAX_SNIPPET_BYTES:
+                    break
             read_ok = True
         if not read_ok:
             return ""
-        try:
-            text = response.text
-        except Exception:  # pragma: no cover - guarded by read_ok
-            return ""
-        collapsed = " ".join(self._redact(text, response.request).split())
-        # Stripped after collapsing, so the limit counts characters the user sees.
-        return collapsed.translate(_CONTROL_CHARS)[:_BODY_SNIPPET_LIMIT]
+        # No slice. The loop above already stopped one chunk past the cap, and
+        # a cut here would sever a straddling secret so the surviving half no
+        # longer matches -- the exact hazard that put half a PAT on stderr
+        # twice already. Nothing may truncate between the read and ``scrub_body``.
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+        return scrub_body(text, self._secrets(response.request))
 
-    def _redact(self, text: str, request: httpx.Request) -> str:
-        """Strip credentials from ``text`` in case the server echoed them back."""
+    def _secrets(self, request: httpx.Request) -> list[str]:
+        """Credentials carried by ``request`` that a server could echo back."""
         authorization = request.headers.get("Authorization", "")
-        secrets = [
+        return [
             authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else "",
             *(request.headers.get(header, "") for header in _SECRET_HEADERS),
         ]
-        for secret in secrets:
-            if secret:
-                text = text.replace(secret, "<redacted>")
-        return text
 
     def _format(self, response: httpx.Response, snippet: str, *, fatal: bool) -> str:
-        headline, remediation = self._diagnose(response)
+        headline, advice = self._diagnose(response)
         lines = [
             headline,
             f"  url:       {self.url}",
@@ -192,7 +569,7 @@ class HttpErrorReporter:
         ]
         if snippet:
             lines.append(f"  server:    {snippet}")
-        lines.append(remediation)
+        lines.append(advice)
         lines.append(self._disposition(fatal=fatal))
         return "\n".join(lines)
 
@@ -206,12 +583,18 @@ class HttpErrorReporter:
         failure as a local-credential failure.
         """
         status = response.status_code
-        reason = response.reason_phrase or ""
+        reason = scrub_reason(response.reason_phrase or "", self._secrets(response.request))
+        # Proxy-authored, never server-authored, so it needs no scrubbing. Only
+        # the remediation is substituted; the headline stays as written, which
+        # is what keeps this module from having to know what the proxy did to
+        # the credential before sending it.
+        proxy_remediation = remediation(response.request)
 
         if status == 401:
             return (
                 f"uc-mcp-proxy: the remote MCP server rejected your credentials (HTTP {status} {reason}).",
-                f"The token for profile {self.profile!r} was minted successfully, so the "
+                proxy_remediation
+                or f"The token for profile {self.profile!r} was minted successfully, so the "
                 f"server rejected it rather than it being absent locally. The token may "
                 f"have expired, or this profile's identity may not be recognized by the "
                 f"target.",
@@ -219,7 +602,12 @@ class HttpErrorReporter:
         if status == 403:
             return (
                 f"uc-mcp-proxy: the remote MCP server refused this request (HTTP {status} {reason}).",
-                f"The credential for profile {self.profile!r} authenticated successfully "
+                # The default text advises OAuth U2M -- a browser login. When
+                # the proxy has already exchanged the credential for this
+                # target, that is the one remedy it just made unnecessary, and
+                # the audience this feature exists for has no browser.
+                proxy_remediation
+                or f"The credential for profile {self.profile!r} authenticated successfully "
                 f"but is not authorized for this target. If the target is a Databricks "
                 f"App, it may require OAuth U2M rather than a PAT.",
             )
@@ -276,13 +664,13 @@ def _leaves(exc: BaseException) -> list[BaseException]:
     return leaves
 
 
-def is_only_http_status_errors(exc: BaseException) -> bool:
-    """True if every leaf of ``exc`` is an ``httpx.HTTPStatusError``.
+def is_only_diagnosed_errors(exc: BaseException) -> bool:
+    """True if every leaf of ``exc`` has already been diagnosed to stderr.
 
-    A positive, non-empty match on purpose. Filtering cancellation out first
-    and then asking "is everything left an HTTPStatusError?" answers True for a
-    bare ``CancelledError`` -- which would let the backstop swallow a Ctrl-C and
-    report it as a credential rejection.
+    Generalizes the swallow decision to the second failure shape: a
+    ``ProxyFatalError`` the proxy raised *after* reporting it. Keeps the same
+    positive, non-empty match, so a bare ``CancelledError`` still answers False
+    and Ctrl-C is never reported as a credential rejection.
     """
     leaves = _leaves(exc)
-    return bool(leaves) and all(isinstance(leaf, httpx.HTTPStatusError) for leaf in leaves)
+    return bool(leaves) and all(isinstance(leaf, (httpx.HTTPStatusError, ProxyFatalError)) for leaf in leaves)

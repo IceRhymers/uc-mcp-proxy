@@ -58,9 +58,13 @@ hand — on the workspace we tested, the segment Databricks documents as
 convention.
 
 > **Apps reject raw personal access tokens.** The App front door requires an
-> OAuth token, so use `--auth-type databricks-cli` (browser-based OAuth U2M)
-> when connecting to a Databricks App. Managed and External MCP servers also
-> work with PAT and other auth types.
+> OAuth token. Either use `--auth-type databricks-cli` (browser-based OAuth
+> U2M), or point a PAT profile at the App URL and the proxy exchanges the PAT
+> for an app-scoped token automatically — see
+> [Databricks Apps from a PAT profile](#databricks-apps-from-a-pat-profile).
+> The PAT must be one the exchange accepts (a Lakebox credential, not a classic
+> `dapi…` PAT). Managed and External MCP servers work with PAT and other auth
+> types as-is.
 
 ## Usage
 
@@ -95,7 +99,81 @@ uc-mcp-proxy --url <MCP_SERVER_URL> [--profile <DATABRICKS_PROFILE>] [--auth-typ
 | `--profile` | Databricks CLI profile name (uses default if omitted) |
 | `--auth-type` | Databricks auth type, e.g. `databricks-cli` |
 | `--meta KEY=VALUE` | Meta parameter injected into `tools/call` `_meta` (repeatable) |
+| `--client-id` | App's `oauth2_app_client_id` — sets the RFC 8693 exchange audience explicitly, skipping auto-discovery |
+| `--pat-exchange` | Force the exchange on a non-App URL and bypass the classic-`dapi`-PAT refusal |
+| `--scope SCOPE` | OAuth scope for the exchange (repeatable; a value may list several space-separated). Overrides discovered scopes |
 | `--no-verify-ssl` | Disable SSL certificate verification (use with caution — see below) |
+
+## Databricks Apps from a PAT profile
+
+A Databricks App refuses a raw personal access token — its front door wants an
+OAuth token minted *for that app*. Rather than forcing a browser login, the
+proxy trades your PAT for one (RFC 8693 token exchange) on your behalf, and it
+works this out automatically.
+
+**The common case needs no exchange flags.** Point a PAT profile at an App URL
+and the proxy detects the App host (`*.databricksapps.com`), looks up the app's
+`oauth2_app_client_id` and `effective_user_api_scopes` from workspace metadata,
+and runs the exchange:
+
+```bash
+uc-mcp-proxy \
+  --url https://<app-name>-<workspace-id>.aws.databricksapps.com/mcp \
+  --profile MY_PAT_PROFILE
+```
+
+```json
+{
+  "mcpServers": {
+    "databricks-app": {
+      "command": "uvx",
+      "args": [
+        "uc-mcp-proxy",
+        "--url", "https://<app-name>-<workspace-id>.aws.databricksapps.com/mcp",
+        "--profile", "MY_PAT_PROFILE"
+      ]
+    }
+  }
+}
+```
+
+The credential must be one the exchange accepts. **A Lakebox-generated
+environment credential works; a classic, hand-minted `dapi…` PAT does not** —
+the platform rejects it as an exchange subject. When the proxy sees an App URL
+with a `dapi…` token it refuses up front with that explanation rather than
+leaking the token on a doomed request. See
+[`docs/token-exchange.md`](docs/token-exchange.md) for the evidence.
+
+Overrides, for when detection or discovery is not enough:
+
+- `--client-id <oauth2_app_client_id>` — set the audience explicitly and skip
+  discovery (e.g. the identity cannot list the app). `--scope` then supplies the
+  scopes, since discovery is skipped.
+- `--scope "a b"` — override the discovered scopes. Repeatable.
+- `--pat-exchange` — force the exchange when `--url` is not recognized as an App
+  host, and bypass the classic-PAT refusal. Discovery still fills the client id
+  and scopes unless `--client-id` is given.
+
+Worth knowing:
+
+- **The exchange requires a PAT profile.** `--client-id` / `--pat-exchange` on
+  any other auth type exit immediately rather than pretending to work.
+  `DATABRICKS_TOKEN` counts as a PAT.
+- **`--scope` is required by real Apps.** An App with declared
+  `effective_user_api_scopes` rejects a scope-less exchange; discovery supplies
+  them automatically, and the proxy warns if it ends up with none to send.
+- **The exchanged token is short-lived** (about an hour) and is re-minted
+  automatically, including once in-place if the app rejects it mid-session, so
+  long sessions do not need restarting.
+- **Your PAT is never forwarded to the app.** It goes only to the workspace
+  token endpoint, as the subject of the exchange. For any `pat` profile the
+  proxy also stops populating `X-Forwarded-Access-Token`, which the platform
+  supplies itself — a raw PAT there would be handed to arbitrary app code, and
+  it would survive a cross-origin redirect that strips `Authorization`.
+- **Verified on one AWS workspace at one point in time.** The accepted request
+  shape is undocumented, so treat it as empirical rather than contractual; a
+  refusal prints the exact request that was sent so a platform change is
+  diagnosable rather than mysterious.
 
 ## Meta Parameters (Managed MCP)
 
@@ -164,6 +242,11 @@ Or in `.mcp.json`:
 ```
 
 > **Security warning:** `--no-verify-ssl` disables all certificate validation, which exposes connections to man-in-the-middle (MITM) attacks. Only use this flag in trusted network environments (e.g. a private corporate VPN) where you control the network path to the Databricks workspace.
+>
+> Combined with `--client-id` the exposure is wider than usual: the token
+> exchange sends your PAT in a request **body** to the workspace token
+> endpoint, not only as a header. Anyone able to intercept that connection
+> reads a long-lived, full-privilege credential.
 
 ## How It Works
 
@@ -179,15 +262,17 @@ Authentication is handled by the [Databricks SDK](https://docs.databricks.com/de
 | Auth type | Managed / External MCP | Apps MCP |
 |-----------|------------------------|----------|
 | `databricks-cli` — token from `~/.databrickscfg` | ✅ | ✅ recommended |
-| `pat` — personal access token | ✅ | ❌ rejected [^pat] |
+| `pat` — personal access token | ✅ | ✅ auto-exchange [^pat] |
 | `oauth-m2m` — service principal | ✅ | ✅ [^m2m] |
 | OAuth U2M — browser-based login | ✅ | ✅ |
 
 [^pat]: An App rejects a PAT sent as-is, because it requires an OAuth token.
     That is a statement about the *token*, not about your profile: a PAT can be
-    exchanged for an OAuth token (RFC 8693), which uc-mcp-proxy does not do
-    today. Until it does, PAT users should authenticate with
-    `--auth-type databricks-cli` rather than treating Apps as unreachable.
+    exchanged for an app-scoped OAuth token (RFC 8693), and uc-mcp-proxy does
+    this automatically when a PAT profile points at an App URL — no
+    `--client-id` needed. The exchange only accepts certain PAT credentials
+    (a Lakebox-generated one, not a classic `dapi…` PAT). See
+    [Databricks Apps from a PAT profile](#databricks-apps-from-a-pat-profile).
 
 [^m2m]: Verified against a live App-hosted MCP server: `initialize`,
     `tools/list`, and `tools/call` all succeed through the proxy with a service
@@ -204,7 +289,9 @@ stderr naming the status, the URL, the profile, and the auth type in use.
 | Message | Meaning | Fix |
 |---------|---------|-----|
 | `rejected your credentials (HTTP 401)` | The token was minted locally but the server rejected it — it may have expired, or this profile's identity is not recognized by the target. | Refresh the profile's credentials. For `databricks-cli`, run `databricks auth login --profile <name>`. Against a Databricks App this also appears when the identity simply lacks `CAN_USE` on the app — check the app's permissions before assuming the credential is bad. |
-| `refused this request (HTTP 403)` | Authenticated successfully, but not authorized for this target. | Check your grants on the target. Pointing a `pat` profile at a Databricks App produces this — Apps reject a raw PAT and need an OAuth token, so use `--auth-type databricks-cli`. |
+| `refused this request (HTTP 403)` | Authenticated successfully, but not authorized for this target. | Check your grants on the target. Pointing a `pat` profile at a Databricks App without `--client-id` produces this — Apps reject a raw PAT and need an OAuth token. |
+| `refused the PAT token exchange (HTTP 400)` | The workspace would not exchange your PAT for an app token. The message prints the exact request that was sent. | Check `--client-id` is the app's `oauth2_app_client_id` and that `--scope` matches its `effective_user_api_scopes`. Note an `invalid audience` error can also mean the requested token type was rejected, so a correct `--client-id` is not proof the flag is at fault. |
+| `rejected your credentials (HTTP 401)` whose remediation names `--client-id` | The exchange succeeded but the app refused the resulting token, twice — so it is configuration, not expiry. | Confirm this identity has `CAN USE` on the app, and that `--scope` covers what the app requires. |
 | `no MCP endpoint at this URL (HTTP 404)` | The URL is wrong. Not an auth failure. | Check `--url`. |
 | `the MCP session expired server-side (HTTP 404)` | The server no longer recognizes this session. | Restart the MCP client to establish a new session. |
 | `the remote MCP server failed (HTTP 5xx)` | Server-side error, **not** an authentication problem. | Retry; check Databricks service status. |

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import sys
 import time
 from collections.abc import AsyncIterator
 
@@ -30,6 +31,13 @@ if _BaseExceptionGroup is None:  # pragma: no cover - version-dependent
 URL = "https://example.com/mcp"
 PROFILE = "test-profile"
 AUTH_TYPE = "oauth-u2m"
+
+
+def await_sync(coro):
+    """Drive a coroutine to completion from a sync test."""
+    import asyncio
+
+    return asyncio.run(coro)
 
 
 def make_reporter():
@@ -402,38 +410,6 @@ def make_status_error() -> httpx.HTTPStatusError:
     )
 
 
-SWALLOW_CASES = {
-    "bare_http_status_error": lambda: make_status_error(),
-    "group_of_one": lambda: _BaseExceptionGroup("g", [make_status_error()]),
-    "nested_group": lambda: _BaseExceptionGroup("g", [_BaseExceptionGroup("h", [make_status_error()])]),
-}
-
-RERAISE_CASES = {
-    "bare_cancelled": lambda: asyncio.CancelledError(),
-    "bare_keyboard_interrupt": lambda: KeyboardInterrupt(),
-    "bare_system_exit": lambda: SystemExit(),
-    "group_of_cancelled": lambda: _BaseExceptionGroup("g", [asyncio.CancelledError()]),
-    "group_with_value_error": lambda: _BaseExceptionGroup("g", [make_status_error(), ValueError("nope")]),
-    "group_with_cancelled": lambda: _BaseExceptionGroup("g", [make_status_error(), asyncio.CancelledError()]),
-}
-
-
-@pytest.mark.parametrize("factory", SWALLOW_CASES.values(), ids=list(SWALLOW_CASES))
-def test_is_only_http_status_errors_accepts_pure_status_failures(factory):
-    """Groups whose every leaf is an HTTPStatusError may be swallowed."""
-    from uc_mcp_proxy.errors import is_only_http_status_errors
-
-    assert is_only_http_status_errors(factory()) is True
-
-
-@pytest.mark.parametrize("factory", RERAISE_CASES.values(), ids=list(RERAISE_CASES))
-def test_is_only_http_status_errors_rejects_anything_else(factory):
-    """Cancellation, interrupts and mixed groups must reach the caller."""
-    from uc_mcp_proxy.errors import is_only_http_status_errors
-
-    assert is_only_http_status_errors(factory()) is False
-
-
 def test_leaves_flattens_nested_groups():
     """``_leaves`` returns the non-group leaves in order."""
     from uc_mcp_proxy.errors import _leaves
@@ -492,3 +468,933 @@ async def test_control_characters_are_stripped_from_the_body_snippet(capsys):
     # ...but only inside the server-echo line, which the real diagnosis frames.
     assert "the remote MCP server failed" in err
     assert err.rstrip().endswith("Exiting.")
+
+
+# ---------------------------------------------------------------------------
+# 17: an armed retry suppresses exactly one 401, and only a 401
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_armed_401_is_suppressed_and_leaves_no_trace(capsys):
+    """An armed 401 prints a retry notice but must not consume the dedup slot.
+
+    Leaving ``reported`` untouched is load-bearing: a suppressed 401 must not
+    consume the ``(role, status)`` dedup slot the real report will need, or a
+    second 401 -- the retry's own -- would be silently swallowed by the dedup
+    check instead of reported.
+    """
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(401)
+    arm_retry(response.request, armed=True)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1
+    assert "retry" in err.lower()
+    assert reporter.reported == set()
+    assert reporter.fatal_message is None
+    assert not reporter.fatal.is_set()
+    assert reporter.diagnosed is False
+
+
+@pytest.mark.anyio
+async def test_unarmed_401_is_reported_normally(capsys):
+    """Non-vacuous counterpart to the armed case: an unarmed 401 is reported."""
+    reporter = make_reporter()
+    response = make_response(401)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert reporter.reported == {("request", 401)}
+    assert reporter.fatal_message is not None
+    assert reporter.fatal.is_set()
+    assert reporter.diagnosed is True
+
+
+@pytest.mark.anyio
+async def test_armed_non_401_is_still_reported(capsys):
+    """Suppression is 401-only: an armed request still reports a 500."""
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(500)
+    arm_retry(response.request, armed=True)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "500" in err
+    assert reporter.reported == {("request", 500)}
+    assert reporter.fatal.is_set()
+
+
+@pytest.mark.anyio
+async def test_disarmed_retry_401_is_reported(capsys):
+    """A retry marker flipped back off no longer suppresses the 401."""
+    from uc_mcp_proxy.errors import arm_retry
+
+    reporter = make_reporter()
+    response = make_response(401)
+    arm_retry(response.request, armed=True)
+    arm_retry(response.request, armed=False)
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert reporter.reported == {("request", 401)}
+    assert reporter.fatal.is_set()
+    assert reporter.fatal_message is not None
+
+
+# ---------------------------------------------------------------------------
+# 18: proxy-authored remediation replaces the generic 401/403 advice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_proxy_remediation_replaces_the_generic_401_text(capsys):
+    """Proxy-authored remediation substitutes for the default 401 wording."""
+    from uc_mcp_proxy.errors import set_remediation
+
+    reporter = make_reporter()
+    response = make_response(401)
+    set_remediation(response.request, "SENTINEL-REMEDIATION")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "SENTINEL-REMEDIATION" in err
+    assert "may have expired" not in err.lower()
+    assert "rejected your credentials" in err.lower()
+
+
+@pytest.mark.anyio
+async def test_proxy_remediation_replaces_the_403_oauth_u2m_advice(capsys):
+    """Proxy-authored remediation substitutes for the default 403 wording.
+
+    When the proxy has already exchanged the credential for this target,
+    advising a browser login is the one remedy it just made unnecessary --
+    and this feature's audience has no browser.
+    """
+    from uc_mcp_proxy.errors import set_remediation
+
+    reporter = make_reporter()
+    response = make_response(403)
+    set_remediation(response.request, "SENTINEL-REMEDIATION")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "SENTINEL-REMEDIATION" in err
+    assert "OAuth U2M" not in err
+
+
+@pytest.mark.anyio
+async def test_403_without_remediation_keeps_the_default_advice(capsys):
+    """Non-vacuous counterpart: with no remediation set, the default persists."""
+    reporter = make_reporter()
+
+    await reporter.on_response(make_response(403))
+
+    err = capsys.readouterr().err
+    assert "OAuth U2M" in err
+
+
+# ---------------------------------------------------------------------------
+# 19: report_fatal is the second entrance, reserved for proxy-side failures
+# ---------------------------------------------------------------------------
+
+
+def test_report_fatal_sets_every_field_the_backstop_reads(capsys):
+    """One call to ``report_fatal`` leaves the whole post-state consistent."""
+    reporter = make_reporter()
+    message = "uc-mcp-proxy: token exchange failed."
+
+    reporter.report_fatal(message)
+
+    err = capsys.readouterr().err
+    assert err.count(message) == 1
+    assert reporter.fatal_message == message
+    assert reporter.last_message == message
+    assert reporter.fatal.is_set()
+    assert reporter.reported == set()
+    assert reporter.diagnosed is True
+
+
+def test_report_fatal_is_idempotent_and_silent_while_shutting_down(capsys):
+    """A second call is silent, and so is any call made during shutdown.
+
+    The SDK's teardown DELETE goes out through the same auth flow, so a
+    session that outlived its token can reach this on the way out. A clean
+    multi-hour session must not exit non-zero because a refresh failed during
+    shutdown.
+    """
+    reporter = make_reporter()
+    first_message = "uc-mcp-proxy: token exchange failed."
+    reporter.report_fatal(first_message)
+    capsys.readouterr()
+
+    reporter.report_fatal("uc-mcp-proxy: a different message entirely.")
+
+    assert capsys.readouterr().err == ""
+    assert reporter.fatal_message == first_message
+    assert reporter.last_message == first_message
+
+    shutting_down_reporter = make_reporter()
+    shutting_down_reporter.shutting_down = True
+
+    shutting_down_reporter.report_fatal(first_message)
+
+    assert capsys.readouterr().err == ""
+    assert shutting_down_reporter.fatal_message is None
+    assert shutting_down_reporter.last_message is None
+    assert not shutting_down_reporter.fatal.is_set()
+
+
+# ---------------------------------------------------------------------------
+# 20: diagnosed answers "has the user already been told?" from either entrance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("trigger", ["reported_failure", "report_fatal"])
+async def test_diagnosed_is_true_from_either_entrance(trigger):
+    """Both ``_report`` and ``report_fatal`` flip ``diagnosed`` to True."""
+    reporter = make_reporter()
+    assert reporter.diagnosed is False
+
+    if trigger == "reported_failure":
+        await reporter.on_response(make_response(500))
+    else:
+        reporter.report_fatal("uc-mcp-proxy: proxy-side failure.")
+
+    assert reporter.diagnosed is True
+
+
+# ---------------------------------------------------------------------------
+# 21: is_only_diagnosed_errors generalizes the swallow decision to ProxyFatalError
+# ---------------------------------------------------------------------------
+
+
+def make_proxy_fatal_error():
+    from uc_mcp_proxy.errors import ProxyFatalError
+
+    return ProxyFatalError("diagnosed already")
+
+
+class _EmptyGroupStub(BaseException):
+    """Duck-types as an exception group with zero leaves.
+
+    The real ``BaseExceptionGroup`` constructor refuses an empty sequence, so
+    an actual empty group cannot be built; this stands in for one to exercise
+    the ``bool(leaves)`` guard in ``_leaves``' caller.
+    """
+
+    exceptions: tuple[BaseException, ...] = ()
+
+
+DIAGNOSED_SWALLOW_CASES = {
+    "bare_http_status_error": lambda: make_status_error(),
+    "bare_proxy_fatal_error": lambda: make_proxy_fatal_error(),
+    "group_of_status_and_proxy_fatal": lambda: _BaseExceptionGroup(
+        "g", [make_status_error(), make_proxy_fatal_error()]
+    ),
+    "nested_group": lambda: _BaseExceptionGroup("g", [_BaseExceptionGroup("h", [make_status_error()])]),
+}
+
+DIAGNOSED_RERAISE_CASES = {
+    "bare_cancelled": lambda: asyncio.CancelledError(),
+    "bare_keyboard_interrupt": lambda: KeyboardInterrupt(),
+    "bare_system_exit": lambda: SystemExit(),
+    "bare_runtime_error": lambda: RuntimeError("boom"),
+    "group_of_cancelled": lambda: _BaseExceptionGroup("g", [asyncio.CancelledError()]),
+    "group_with_runtime_error": lambda: _BaseExceptionGroup("g", [make_status_error(), RuntimeError("boom")]),
+    "group_with_cancelled": lambda: _BaseExceptionGroup("g", [make_status_error(), asyncio.CancelledError()]),
+    "empty_group": lambda: _EmptyGroupStub(),
+}
+
+
+@pytest.mark.parametrize("factory", DIAGNOSED_SWALLOW_CASES.values(), ids=list(DIAGNOSED_SWALLOW_CASES))
+def test_is_only_diagnosed_errors_accepts_status_and_proxy_fatal_leaves(factory):
+    """Groups whose every leaf is a status error or a ``ProxyFatalError`` pass."""
+    from uc_mcp_proxy.errors import is_only_diagnosed_errors
+
+    assert is_only_diagnosed_errors(factory()) is True
+
+
+@pytest.mark.parametrize("factory", DIAGNOSED_RERAISE_CASES.values(), ids=list(DIAGNOSED_RERAISE_CASES))
+def test_is_only_diagnosed_errors_rejects_anything_else(factory):
+    """Cancellation, other exceptions, and an empty group must reach the caller.
+
+    The empty and cancelled cases are why this is a positive, non-empty match
+    -- otherwise the backstop would swallow a Ctrl-C and report it as a
+    credential rejection.
+    """
+    from uc_mcp_proxy.errors import is_only_diagnosed_errors
+
+    assert is_only_diagnosed_errors(factory()) is False
+
+
+# ---------------------------------------------------------------------------
+# 22: scrub_body redacts before truncating and strips terminal control codes
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_body_redacts_before_truncating():
+    """A secret straddling the 500-char boundary must be fully redacted.
+
+    Truncating first would half-print a credential: the portion of the raw
+    secret that falls inside the first 500 characters would survive even
+    though the rest was cut off.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "SECRET-XYZ-1234567890ABCDEFGH"  # 30 chars
+    padding = "a" * 490
+    text = padding + secret  # secret spans chars 490-519, straddling char 500
+
+    result = scrub_body(text, [secret])
+
+    assert secret not in result
+    assert "<redacted>" in result
+    assert len(result) <= 500
+
+
+def test_scrub_body_strips_control_characters():
+    """ESC and CSI sequences are removed from the scrubbed text."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    hostile = "before\x1b[31mafter\x9b1mtail\x07end"
+
+    result = scrub_body(hostile, [])
+
+    assert "\x1b" not in result
+    assert "\x9b" not in result
+    assert "\x07" not in result
+
+
+def test_scrub_body_collapses_whitespace_and_truncates():
+    """Newlines and tabs collapse to single spaces, and output is bounded."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    text = "line one\n\t line two\r\n" * 50
+
+    result = scrub_body(text, [])
+
+    assert len(result) <= 500
+    assert "\n" not in result
+    assert "\t" not in result
+    assert "\r" not in result
+
+
+def test_scrub_body_ignores_empty_secrets():
+    """An empty secret must not splice ``<redacted>`` between every character."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    text = "real secret embedded here and real again"
+
+    result = scrub_body(text, ["", "real"])
+
+    assert "real" not in result
+    assert result.count("<redacted>") == 2
+
+
+# ---------------------------------------------------------------------------
+# 24: the scrubber cannot be walked around by splitting the secret
+# ---------------------------------------------------------------------------
+
+
+SPLIT_SECRET_CASES = {
+    "nul_byte": "\x00",
+    "escape": "\x1b",
+    "newline": "\n",
+    "tab": "\t",
+    "carriage_return": "\r",
+    "c1_control": "\x85",
+    "zero_width_space": "​",
+    "bidi_override": "‮",
+    "single_space": " ",
+    "run_of_spaces": "   ",
+}
+
+
+@pytest.mark.parametrize("separator", SPLIT_SECRET_CASES.values(), ids=list(SPLIT_SECRET_CASES))
+def test_scrub_body_redacts_a_secret_the_server_split(separator):
+    """A credential echoed with a byte inserted into it must still be redacted.
+
+    This is the whole reason normalization runs before redaction. Redacting
+    first, the inserted byte defeats ``str.replace``, and the control strip that
+    follows then *deletes* it -- reassembling the secret verbatim on its way to
+    the terminal. The proxy would have printed the credential itself.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    split = secret[:14] + separator + secret[14:]
+
+    result = scrub_body(f'{{"error":"rejected {split}"}}', [secret])
+
+    assert secret not in result, f"credential reassembled: {result!r}"
+    assert "<redacted>" in result
+    # Non-vacuous: the surrounding text really did survive, so this is not
+    # passing because the whole body vanished.
+    assert "rejected" in result
+
+
+def test_scrub_body_still_redacts_an_unsplit_secret():
+    """The ordinary case keeps working -- guards against over-fitting to splits."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+
+    assert scrub_body(f"body {secret} end", [secret]) == "body <redacted> end"
+
+
+def test_scrub_body_strips_bidi_and_zero_width_characters():
+    """Characters that reorder the rendered line are removed along with C0/C1.
+
+    They cannot move the cursor, but they can visually detach a ``<redacted>``
+    marker from what it redacts, or render a hostname backwards.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    result = scrub_body("safe ‮ evil ⁦x⁩ ​ ﻿ end", [])
+
+    for char in ("‮", "⁦", "⁩", "​", "﻿"):
+        assert char not in result
+    assert "safe" in result and "end" in result
+
+
+# ---------------------------------------------------------------------------
+# 25: the reason phrase is server-authored too
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_reason_strips_escapes_and_bounds_length():
+    """The status line is as server-controlled as the body, and far longer.
+
+    h11's grammar rejects only NUL and whitespace, so ESC reaches us intact and
+    httpx's ASCII decode preserves it -- and h11 allows 16 KiB of it, where
+    bodies are capped at 500.
+    """
+    from uc_mcp_proxy.errors import scrub_reason
+
+    hostile = "Forbidden\x1b[2K\x1b[1Auc-mcp-proxy: connected OK" + "A" * 500
+
+    result = scrub_reason(hostile)
+
+    assert "\x1b" not in result
+    assert len(result) <= 80
+
+
+@pytest.mark.anyio
+async def test_reported_message_never_carries_an_escape_from_the_reason_phrase(capsys):
+    """End to end: a hostile status line cannot rewrite the terminal.
+
+    Without this the escape defense built for the body snippet is simply walked
+    around -- the headline interpolates the reason phrase directly.
+    """
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    reporter = make_reporter()
+    request = httpx.Request("POST", URL, extensions={_ROLE_KEY: "request"})
+    response = httpx.Response(403, request=request, text="{}")
+    # httpx derives reason_phrase from the status code, so set it directly --
+    # this is the value a real server puts on the wire.
+    response.extensions = dict(response.extensions, reason_phrase=b"Forbidden\x1b[2K\x1b[1AFAKE")
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "403" in err
+
+
+# ---------------------------------------------------------------------------
+# 26: the forwarded-identity header must not outlive its origin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_guard_keeps_forwarded_token_on_the_original_origin():
+    """The header survives the hop the user actually asked for."""
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    request = httpx.Request("POST", URL, headers={"X-Forwarded-Access-Token": "tok"})
+    await guard_forwarded_token(request)
+
+    assert request.headers["X-Forwarded-Access-Token"] == "tok"
+
+
+@pytest.mark.anyio
+async def test_guard_drops_forwarded_token_on_a_cross_origin_hop():
+    """A redirect off the target origin must not carry the credential along.
+
+    httpx strips ``Authorization`` on a cross-origin hop but knows nothing about
+    this header, so the foreign origin would otherwise learn a live token *and*
+    learn it in the one case where the real credential was already removed.
+    """
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    # Extensions are copied per hop, so the rebuilt request carries the origin
+    # recorded on the first one -- the same mechanism ``stamp_role`` relies on.
+    redirected = httpx.Request(
+        "GET",
+        "https://elsewhere.example.net/x",
+        headers={"X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(redirected)
+
+    assert "X-Forwarded-Access-Token" not in redirected.headers
+
+
+@pytest.mark.anyio
+async def test_guard_never_raises_on_a_malformed_request():
+    """Request hooks run outside httpx's ``try``; a raise here escapes entirely."""
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    class _Exploding:
+        url = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    await guard_forwarded_token(_Exploding())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 27: nothing may truncate before redaction, at any internal boundary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset", [-2, -1, 0, 1, 2], ids=lambda n: f"straddle{n:+d}")
+def test_no_internal_boundary_can_sever_a_secret(offset):
+    """A secret is redacted wherever it falls, however long the body is.
+
+    An earlier version bounded the redaction window to the first 8 KiB *before*
+    stripping control characters. Because stripping deletes, content past that
+    cut shifted left into the visible window while the cut itself had already
+    severed the secret -- printing half a credential. There is now no truncation
+    before redaction anywhere; this pins that for a body far larger than any
+    such window.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    # Control padding is deleted, so the visible text stays inside the snippet
+    # limit while the raw string is long enough to cross any internal bound.
+    padding = "\x01" * 8000 + "A" * (192 + offset)
+    result = scrub_body(padding + secret + " tail", [secret])
+
+    longest = max((n for n in range(len(secret), 3, -1) if secret[:n] in result), default=0)
+    assert longest == 0, f"leaked a {longest}-character prefix: {result[-60:]!r}"
+    assert "<redacted>" in result
+
+
+def test_snippet_read_is_bounded(monkeypatch):
+    """A huge error body is not buffered whole to produce a 500-char snippet.
+
+    The 5-second read timeout caps how *long* a server may talk, which on a
+    fast link is still hundreds of megabytes.
+    """
+    from uc_mcp_proxy import errors
+
+    monkeypatch.setattr(errors, "_MAX_SNIPPET_BYTES", 64)
+    delivered: list[int] = []
+
+    class _Chunked(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(1000):
+                delivered.append(1)
+                yield b"B" * 32
+
+    reporter = make_reporter()
+    response = make_response(500, stream=_Chunked())
+
+    snippet = await_sync(reporter._read_snippet(response))
+
+    assert len(snippet) <= 64
+    assert len(delivered) <= 3, f"read {len(delivered)} chunks; the cap did not stop it"
+
+
+# ---------------------------------------------------------------------------
+# 28: invisible characters must not be able to hide a credential
+# ---------------------------------------------------------------------------
+
+
+def _invisible_separators():
+    """Every non-whitespace Cc/Cf codepoint, sampled across the ranges.
+
+    Generated from Unicode categories rather than listed. A hand-written list
+    was wrong twice, and each time the fix was to add the members someone had
+    just thought of.
+    """
+    import unicodedata
+
+    found = [
+        cp
+        for cp in range(sys.maxunicode + 1)
+        if unicodedata.category(chr(cp)) in ("Cc", "Cf") and not chr(cp).isspace()
+    ]
+    return found[::37]  # a spread across every range, not just the low ones
+
+
+@pytest.mark.parametrize("codepoint", _invisible_separators(), ids=lambda cp: f"U+{cp:04X}")
+def test_invisible_characters_cannot_hide_a_secret(codepoint):
+    """A credential interleaved with invisible characters is still redacted.
+
+    These render as nothing, so a log reader sees the bare credential while an
+    exact-match redactor -- and a secret scanner grepping the file -- sees
+    something that does not match.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    hidden = chr(codepoint).join(secret)
+
+    result = scrub_body(f"error {hidden} end", [secret])
+
+    assert secret not in result
+    assert chr(codepoint) not in result
+    assert "<redacted>" in result
+
+
+# ---------------------------------------------------------------------------
+# 29: the reason phrase is a credential channel, not just an escape channel
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_reason_redacts_secrets_not_only_escapes():
+    """Stripping escapes without redacting leaves a full-disclosure channel."""
+    from uc_mcp_proxy.errors import scrub_reason
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+
+    result = scrub_reason(f"Forbidden token={secret}", [secret])
+
+    assert secret not in result
+    assert "<redacted>" in result
+
+
+@pytest.mark.anyio
+async def test_headline_never_carries_a_credential_from_the_reason_phrase(capsys):
+    """End to end: the status line cannot print what the body line redacts.
+
+    A server needs no padding and no positioning for this -- it echoes the
+    credential it was just sent, in the one field that was not being scrubbed,
+    and it lands on the line directly above a correctly-redacted body.
+    """
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    token = "dapiDEADBEEF0123456789abcdef"
+    reporter = make_reporter()
+    request = httpx.Request(
+        "POST", URL, headers={"Authorization": f"Bearer {token}"}, extensions={_ROLE_KEY: "request"}
+    )
+    response = httpx.Response(403, request=request, text="{}")
+    response.extensions = dict(response.extensions, reason_phrase=f"Forbidden token={token}".encode())
+
+    await reporter.on_response(response)
+
+    err = capsys.readouterr().err
+    assert token not in err, "the credential reached stderr via the status line"
+    assert "403" in err
+
+
+# ---------------------------------------------------------------------------
+# 30: the redirect guard covers every header this module calls a secret
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_guard_drops_the_session_id_cross_origin():
+    """``mcp-session-id`` is declared a secret here, so it must not travel either.
+
+    Unlike the forwarded token, this one discloses to a party that never held
+    it: httpx strips ``Authorization`` on the hop, so the foreign origin would
+    otherwise receive a live session id and nothing else to explain it.
+    """
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    redirected = httpx.Request(
+        "GET",
+        "https://elsewhere.example.net/x",
+        headers={"mcp-session-id": "SESSION-SECRET", "X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(redirected)
+
+    assert "mcp-session-id" not in redirected.headers
+    assert "X-Forwarded-Access-Token" not in redirected.headers
+
+
+@pytest.mark.anyio
+async def test_guard_drops_credentials_on_a_scheme_downgrade():
+    """Same host over plain http is a different origin, and the riskier one."""
+    from uc_mcp_proxy.errors import _ORIGIN_KEY, guard_forwarded_token
+
+    downgraded = httpx.Request(
+        "GET",
+        "http://example.com/mcp",
+        headers={"X-Forwarded-Access-Token": "tok"},
+        extensions={_ORIGIN_KEY: ("https", "example.com", None)},
+    )
+    await guard_forwarded_token(downgraded)
+
+    assert "X-Forwarded-Access-Token" not in downgraded.headers
+
+
+@pytest.mark.anyio
+async def test_guard_fails_closed_when_the_origin_cannot_be_determined():
+    """If anything goes wrong mid-check the credentials stay off, not on.
+
+    Failing open here would hand a credential to a foreign origin, which is the
+    opposite default from ``stamp_role``, where a failure merely loses a label.
+    """
+    from uc_mcp_proxy.errors import guard_forwarded_token
+
+    class _BadUrl(httpx.Request):
+        @property
+        def url(self):
+            raise RuntimeError("boom")
+
+    request = httpx.Request("GET", URL, headers={"X-Forwarded-Access-Token": "tok"})
+    # Swapped after construction: httpx assigns ``self.url`` in ``__init__``,
+    # and a property is a data descriptor, so it wins over the instance dict.
+    request.__class__ = _BadUrl
+
+    await guard_forwarded_token(request)  # must not raise
+
+    assert "X-Forwarded-Access-Token" not in request.headers
+
+
+# ---------------------------------------------------------------------------
+# 31: a secret severed by the read cap must not print its surviving half
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("straddle", [4, 6, 20, 27], ids=lambda n: f"cut_leaves_{n}")
+def test_secret_severed_by_the_read_cap_is_not_printed(straddle):
+    """The read stops at a byte cap, and that cap can land inside a credential.
+
+    Redaction cannot match what was already cut, and reading further does not
+    help -- the next cap has the same edge. What survives is a prefix at the end
+    of the text, and if the discarded remainder was mostly invisible characters
+    it sits well inside the visible window rather than being truncated away.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "dapiDEADBEEF0123456789abcdef"
+    severed = "\x01" * 300 + "A" * 40 + secret[:straddle]
+
+    result = scrub_body(severed, [secret])
+
+    longest = max((n for n in range(len(secret), 3, -1) if secret[:n] in result), default=0)
+    assert longest == 0, f"leaked a {longest}-character prefix: {result[-50:]!r}"
+
+
+def test_a_short_trailing_coincidence_is_left_alone():
+    """The trailing sweep must not mangle ordinary text.
+
+    Counterpart to the test above: a fragment too short to be worth anything is
+    not worth false-positives either.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    assert scrub_body("the value is da", ["dapiDEADBEEF0123456789abcdef"]).endswith("da")
+
+
+# ---------------------------------------------------------------------------
+# 32: the redactor's pattern must stay unambiguous
+# ---------------------------------------------------------------------------
+
+
+def test_stripping_control_characters_cannot_recreate_a_whitespace_run():
+    """Collapse runs last, so no run longer than one space can survive.
+
+    Stripping after collapsing looks equivalent and is not: deleting a control
+    character re-joins the spaces either side of it, re-creating a run the
+    collapse had already flattened. The redactor's pattern is only free of
+    ambiguity because such a run cannot exist, so this is load-bearing.
+    """
+    import re as _re
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    result = scrub_body("A" + " \x00" * 12 + "B", [])
+
+    longest = max((len(run) for run in _re.findall(r" +", result)), default=0)
+    assert longest <= 1, f"whitespace run of {longest} survived: {result!r}"
+
+
+def test_a_server_chosen_secret_cannot_make_redaction_expensive():
+    """``mcp-session-id`` is server-authored, unvalidated, and used as a secret.
+
+    A secret carrying whitespace once produced an ambiguous pattern group per
+    space; against a whitespace run that is combinatorial, and this runs
+    synchronously inside a response hook, so the stdio bridge and the abort
+    path both stop with it. Timed rather than asserted structurally because the
+    failure mode is latency, not a wrong answer.
+    """
+    import time
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    body = "S" + " \x00" * 40 + "X"
+
+    started = time.perf_counter()
+    for spaces in range(4, 20):
+        scrub_body(body, ["S" + " " * spaces + "E"])
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"redaction took {elapsed:.1f}s; the pattern is backtracking"
+
+
+def test_a_very_long_server_chosen_secret_is_matched_literally():
+    """Pattern construction is linear in the needle, and the server picks it."""
+    import time
+
+    from uc_mcp_proxy.errors import scrub_body
+
+    secret = "S" * 16384
+
+    started = time.perf_counter()
+    # Secret first, so the redaction is inside the visible window rather than
+    # being cut away by the snippet limit -- the assertion is about the cost of
+    # the match, but it should not pass merely because nothing was printed.
+    result = scrub_body(secret + "A" * 60000, [secret])
+    elapsed = time.perf_counter() - started
+
+    assert result.startswith("<redacted>")
+    assert elapsed < 1.0, f"took {elapsed:.1f}s"
+
+
+def test_a_secret_that_prefixes_another_does_not_shadow_it():
+    """Longest-first, or the short one redacts and leaves the long one's tail."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    assert scrub_body("x AAAABBBB y", ["AAAA", "AAAABBBB"]) == "x <redacted> y"
+
+
+# ---------------------------------------------------------------------------
+# 33: redaction must not depend on the order secrets happen to be in
+# ---------------------------------------------------------------------------
+
+
+#: Long enough to exceed any pattern cap, because a real OIDC token is: an
+#: RS256 signature alone is 342 base64url characters. A PAT-only fixture hides
+#: every defect that only bites above the cap.
+JWT_LIKE = "eyJhbGciOiJSUzI1NiJ9." + "A" * 480
+PAT_LIKE = "dapi0123456789abcdef0123456789ab"
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n", "­", "​"], ids=["space", "tab", "nl", "shy", "zwsp"])
+def test_a_long_token_keeps_separator_tolerance(separator):
+    """A credential past the pattern cap must not silently lose tolerance.
+
+    The cap exists to bound the cost of a *server-chosen* needle. Applying it to
+    our own token turned separator tolerance off for every OIDC JWT -- which is
+    exactly what this branch mints -- while remaining invisible to any test that
+    only ever uses a 36-character PAT.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    split = JWT_LIKE[:100] + separator + JWT_LIKE[100:]
+
+    result = scrub_body(f"denied {split}", [JWT_LIKE])
+
+    assert JWT_LIKE[:100] not in result, "a 100-character run of the token reached the output"
+    assert "<redacted>" in result
+
+
+def test_a_server_chosen_secret_cannot_consume_the_real_one():
+    """``mcp-session-id`` is server-chosen and unbounded; it must not preempt.
+
+    Redacting secrets one after another lets each one rewrite the string the
+    next one searches. A server that overlaps the real credential by a single
+    character -- and makes its own value longer, so it is processed first --
+    destroys the real credential's own match and leaves the rest in the clear.
+    Spans are computed against the original text for exactly this reason.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    session_id = "A" * 64 + PAT_LIKE[0]
+    body = "upstream refused: " + "A" * 64 + PAT_LIKE
+
+    result = scrub_body(body, [PAT_LIKE, session_id])
+
+    assert PAT_LIKE[1:] not in result, f"leaked all but one character: {result!r}"
+    assert PAT_LIKE not in result
+
+
+def test_redaction_is_order_independent():
+    """The same secrets in either order must give the same output."""
+    from uc_mcp_proxy.errors import scrub_body
+
+    session_id = "A" * 64 + PAT_LIKE[0]
+    body = "upstream refused: " + "A" * 64 + PAT_LIKE
+
+    assert scrub_body(body, [PAT_LIKE, session_id]) == scrub_body(body, [session_id, PAT_LIKE])
+
+
+@pytest.mark.parametrize(
+    "codepoint",
+    [0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800],
+    ids=["choseong", "jungseong", "hangul_filler", "halfwidth", "braille_blank"],
+)
+def test_invisible_non_format_characters_cannot_hide_a_secret(codepoint):
+    """Blank-rendering characters outside ``Cf`` were not being stripped.
+
+    The Hangul fillers are ``Lo`` and the braille blank is ``So``, so a category
+    test for ``Cc``/``Cf`` misses them -- while a terminal renders each as
+    nothing, leaving the credential plainly readable in a log.
+    """
+    from uc_mcp_proxy.errors import scrub_body
+
+    hidden = chr(codepoint).join(PAT_LIKE)
+
+    result = scrub_body(f"error {hidden} end", [PAT_LIKE])
+
+    assert PAT_LIKE not in result
+    assert "<redacted>" in result
+
+
+@pytest.mark.anyio
+async def test_a_compressed_error_body_is_refused_rather_than_decoded():
+    """The proxy's own error-body read has the same exposure as the exchange's.
+
+    httpx decodes on the response's ``Content-Encoding`` whatever was requested,
+    and a whole body can arrive as one chunk -- so it expands past the byte cap
+    before the loop's counter runs at all.
+    """
+    import gzip
+
+    payload = gzip.compress(b"A" * 50_000_000)
+    delivered: list[int] = []
+
+    class _OneChunk(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            delivered.append(1)
+            yield payload
+
+    from uc_mcp_proxy.errors import _ROLE_KEY
+
+    reporter = make_reporter()
+    # Built directly: ``make_response``'s ``headers`` go on the *request*, and
+    # ``Content-Encoding`` is a property of the response.
+    response = httpx.Response(
+        500,
+        request=httpx.Request("POST", URL, extensions={_ROLE_KEY: "request"}),
+        headers={"content-encoding": "gzip"},
+        stream=_OneChunk(),
+    )
+
+    snippet = await reporter._read_snippet(response)
+
+    assert delivered == [], "the body was read despite the refusal"
+    assert "Content-Encoding" in snippet
