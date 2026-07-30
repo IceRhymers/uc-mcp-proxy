@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.1](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.5.0...v0.5.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* diagnose HTTP errors from the remote MCP server instead of crashing or hiding them ([c2fee34](https://github.com/IceRhymers/uc-mcp-proxy/commit/c2fee34e2ca8d026cbba1374367cff9a784a0982))
+* diagnose HTTP errors from the remote MCP server instead of crashing or hiding them ([498e122](https://github.com/IceRhymers/uc-mcp-proxy/commit/498e122c01a77f5fb92f9ef68a5a36160882528b)), closes [#22](https://github.com/IceRhymers/uc-mcp-proxy/issues/22)
+
+
+### Documentation
+
+* correct the Apps URL pattern and the PAT/M2M support claims ([8e8cc42](https://github.com/IceRhymers/uc-mcp-proxy/commit/8e8cc427992e30f34dd9b084fa2b406fa479e537))
+* correct the Apps URL pattern and the PAT/M2M support claims ([9666c40](https://github.com/IceRhymers/uc-mcp-proxy/commit/9666c40ceda0c4ddc807bbcd14157a4a7e6aa564)), closes [#23](https://github.com/IceRhymers/uc-mcp-proxy/issues/23)
+
 ## [0.5.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.4.0...v0.5.0) (2026-05-17)
 
 
