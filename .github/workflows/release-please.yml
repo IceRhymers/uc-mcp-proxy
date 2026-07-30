@@ -16,4 +16,7 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          token: ${{ secrets.GH_TOKEN }}
+          # The repo-scoped GITHUB_TOKEN has the declared contents/pull-request write
+          # permissions. GH_TOKEN is an externally managed PAT and lacks Git Database
+          # access, which prevents release-please from creating its release commit tree.
+          token: ${{ github.token }}
