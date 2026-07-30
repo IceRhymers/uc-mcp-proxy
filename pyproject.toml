@@ -4,7 +4,7 @@ version = "0.5.0"
 description = "MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.8",
+    "mcp>=1.8,<2",
     "databricks-sdk>=0.30.0",
     "httpx",
     "anyio",
