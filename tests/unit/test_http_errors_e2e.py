@@ -1115,6 +1115,15 @@ def test_proxy_process_exits_on_401_with_stdin_still_open():
             "DATABRICKS_TOKEN": "dapi-fake-token",
             "DATABRICKS_CONFIG_FILE": os.devnull,
         }
+        # The env is built from scratch rather than inherited so a developer's
+        # real DATABRICKS_* settings cannot reach the child. On Windows that
+        # also drops SystemRoot, without which winsock fails to initialize and
+        # the child dies importing asyncio's proactor loop (WinError 10106)
+        # before it ever reaches the code under test.
+        for name in ("SystemRoot", "SystemDrive"):
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
         proc = subprocess.Popen(
             [
                 sys.executable,
