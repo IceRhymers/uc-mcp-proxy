@@ -29,7 +29,8 @@ import unicodedata
 from collections.abc import Sequence
 
 import anyio
-import httpx
+
+from uc_mcp_proxy._compat import httpx
 
 
 class ProxyFatalError(Exception):

@@ -5,7 +5,8 @@ from __future__ import annotations
 import anyio
 import pytest
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCRequest
+
+from tests.support import jsonrpc_payload, session_message
 
 pytestmark = pytest.mark.unit
 
@@ -13,40 +14,34 @@ pytestmark = pytest.mark.unit
 def _tools_call(params=None) -> SessionMessage:
     if params is None:
         params = {"name": "q", "arguments": {}}
-    return SessionMessage(
-        message=JSONRPCMessage(
-            root=JSONRPCRequest(
-                jsonrpc="2.0",
-                id=1,
-                method="tools/call",
-                params=params,
-            )
-        )
+    return session_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": params,
+        }
     )
 
 
 def _tools_list() -> SessionMessage:
-    return SessionMessage(
-        message=JSONRPCMessage(
-            root=JSONRPCRequest(
-                jsonrpc="2.0",
-                id=2,
-                method="tools/list",
-                params={},
-            )
-        )
+    return session_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
     )
 
 
 def _tools_call_no_params() -> SessionMessage:
-    return SessionMessage(
-        message=JSONRPCMessage(
-            root=JSONRPCRequest(
-                jsonrpc="2.0",
-                id=3,
-                method="tools/call",
-            )
-        )
+    return session_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+        }
     )
 
 
@@ -55,7 +50,7 @@ def test_inject_meta_adds_meta_to_tools_call():
 
     out = inject_meta(_tools_call(), {"warehouse_id": "abc123"})
 
-    assert out.message.root.params["_meta"] == {"warehouse_id": "abc123"}
+    assert jsonrpc_payload(out).params["_meta"] == {"warehouse_id": "abc123"}
 
 
 def test_inject_meta_ignores_tools_list():
@@ -63,7 +58,7 @@ def test_inject_meta_ignores_tools_list():
 
     out = inject_meta(_tools_list(), {"warehouse_id": "abc"})
 
-    assert "_meta" not in (out.message.root.params or {})
+    assert "_meta" not in (jsonrpc_payload(out).params or {})
 
 
 def test_inject_meta_merges_with_existing_meta():
@@ -74,7 +69,7 @@ def test_inject_meta_merges_with_existing_meta():
     )
     out = inject_meta(msg, {"warehouse_id": "abc"})
 
-    assert out.message.root.params["_meta"] == {
+    assert jsonrpc_payload(out).params["_meta"] == {
         "progressToken": "tok-42",
         "warehouse_id": "abc",
     }
@@ -88,7 +83,7 @@ def test_inject_meta_proxy_wins_on_collision(capsys):
     )
     out = inject_meta(msg, {"warehouse_id": "proxy-val"})
 
-    assert out.message.root.params["_meta"]["warehouse_id"] == "proxy-val"
+    assert jsonrpc_payload(out).params["_meta"]["warehouse_id"] == "proxy-val"
     err = capsys.readouterr().err
     assert "warehouse_id" in err
     assert "override" in err.lower()
@@ -106,7 +101,7 @@ def test_inject_meta_handles_missing_params():
 
     out = inject_meta(_tools_call_no_params(), {"warehouse_id": "abc"})
 
-    assert out.message.root.params == {"_meta": {"warehouse_id": "abc"}}
+    assert jsonrpc_payload(out).params == {"_meta": {"warehouse_id": "abc"}}
 
 
 def test_inject_meta_multiple_keys():
@@ -114,7 +109,7 @@ def test_inject_meta_multiple_keys():
 
     out = inject_meta(_tools_call(), {"warehouse_id": "abc", "catalog": "main"})
 
-    assert out.message.root.params["_meta"] == {
+    assert jsonrpc_payload(out).params["_meta"] == {
         "warehouse_id": "abc",
         "catalog": "main",
     }
@@ -151,8 +146,8 @@ async def test_inject_meta_stream_rewrites_only_tools_call(memory_stream_pair):
         async for m in dest_recv:
             results.append(m)
 
-    assert results[0].message.root.params["_meta"] == {"warehouse_id": "abc"}
-    assert "_meta" not in (results[1].message.root.params or {})
+    assert jsonrpc_payload(results[0]).params["_meta"] == {"warehouse_id": "abc"}
+    assert "_meta" not in (jsonrpc_payload(results[1]).params or {})
 
 
 @pytest.mark.anyio

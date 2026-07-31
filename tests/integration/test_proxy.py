@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import anyio
-import httpx
 import pytest
 from mcp.client.streamable_http import streamable_http_client as _real_streamable_http_client
+
+from tests.support import httpx
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 

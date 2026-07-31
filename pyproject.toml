@@ -4,7 +4,7 @@ version = "0.5.1"
 description = "MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.8,<2",
+    "mcp>=1.8",
     "databricks-sdk>=0.30.0",
     # Bounded deliberately. The auth retry depends on two httpx behaviours that
     # are implementation details rather than documented contracts: response

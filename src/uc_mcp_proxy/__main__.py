@@ -8,18 +8,17 @@ import os
 import sys
 import time
 from collections.abc import AsyncGenerator, Callable, Generator
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 from urllib.parse import urljoin, urlsplit
 
 import anyio
-import httpx
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from databricks.sdk import WorkspaceClient
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest
 
+from uc_mcp_proxy._compat import MessageReceiveStream, MessageSendStream, httpx, jsonrpc_payload
 from uc_mcp_proxy.app_discovery import (
     AppDiscoveryError,
     discover_app,
@@ -239,7 +238,7 @@ class DatabricksAuth(httpx.Auth):
         yield request
 
 
-async def copy_stream(source: MemoryObjectReceiveStream[Any], dest: MemoryObjectSendStream[Any]) -> None:
+async def copy_stream(source: MessageReceiveStream, dest: MessageSendStream) -> None:
     """Copy all messages from source to dest, closing dest when source is exhausted."""
     try:
         async for message in source:
@@ -263,7 +262,7 @@ def inject_meta(
     # for meta params today; _meta is valid on any request per MCP spec.
     if isinstance(message, Exception):
         return message
-    root = message.message.root
+    root = jsonrpc_payload(message)
     if not isinstance(root, JSONRPCRequest) or root.method != "tools/call":
         return message
     if root.params is None:
@@ -281,8 +280,8 @@ def inject_meta(
 
 
 async def inject_meta_stream(
-    source: MemoryObjectReceiveStream[Any],
-    dest: MemoryObjectSendStream[Any],
+    source: MessageReceiveStream,
+    dest: MessageSendStream,
     meta: dict[str, str],
 ) -> None:
     """Like copy_stream, but applies inject_meta to each forwarded message."""
@@ -294,10 +293,10 @@ async def inject_meta_stream(
 
 
 async def bridge(
-    stdio_read: MemoryObjectReceiveStream[Any],
-    stdio_write: MemoryObjectSendStream[Any],
-    http_read: MemoryObjectReceiveStream[Any],
-    http_write: MemoryObjectSendStream[Any],
+    stdio_read: MessageReceiveStream,
+    stdio_write: MessageSendStream,
+    http_read: MessageReceiveStream,
+    http_write: MessageSendStream,
     meta: dict[str, str] | None = None,
 ) -> None:
     """Bidirectional bridge between stdio and HTTP stream pairs.
@@ -649,11 +648,18 @@ async def run(
             ) as httpx_client,
             streamable_http_client(
                 resolved_url,
-                http_client=httpx_client,
+                # Cast because the SDK names its own HTTP library in this
+                # signature, and which library that is varies by SDK major.
+                # ``_compat`` guarantees the client was built from the module
+                # this very SDK imported; mypy only ever sees one of them.
+                http_client=cast(Any, httpx_client),
             ) as (
                 http_read,
                 http_write,
-                _get_session_id,
+                # SDK 1.x yielded a third element, ``get_session_id``, which
+                # this proxy never used; 2.0 dropped it. Starred so the same
+                # unpack accepts either shape.
+                *_,
             ),
         ):
             try:

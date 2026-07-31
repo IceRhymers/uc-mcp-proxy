@@ -28,12 +28,12 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-import httpx
+import httpx as exchange_httpx
 import pytest
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification, JSONRPCRequest
 
 from tests.conftest import FAKE_PAT
+from tests.support import httpx, session_message
 from uc_mcp_proxy import __main__ as main
 from uc_mcp_proxy.errors import HttpErrorReporter, _leaves
 
@@ -59,32 +59,28 @@ TIMEOUT = 10
 
 def _initialize(request_id: int = 1) -> SessionMessage:
     """The ``initialize`` request an MCP client sends first."""
-    return SessionMessage(
-        JSONRPCMessage(
-            JSONRPCRequest(
-                jsonrpc="2.0",
-                id=request_id,
-                method="initialize",
-                params={
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "test-client", "version": "1.0"},
-                },
-            )
-        )
+    return session_message(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0"},
+            },
+        }
     )
 
 
 def _request(method: str, request_id: int) -> SessionMessage:
     """An arbitrary JSON-RPC request (a tool call, from the SDK's point of view)."""
-    return SessionMessage(
-        JSONRPCMessage(JSONRPCRequest(jsonrpc="2.0", id=request_id, method=method, params={})),
-    )
+    return session_message({"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}})
 
 
 def _initialized_notification() -> SessionMessage:
     """The notification whose POST triggers the SDK's ``start_get_stream``."""
-    return SessionMessage(JSONRPCMessage(JSONRPCNotification(jsonrpc="2.0", method="notifications/initialized")))
+    return session_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +239,25 @@ class _Proxy:
         await self._to_proxy.aclose()
 
 
-class _ExchangeTransport(httpx.MockTransport):
+class _ExchangeTransport(exchange_httpx.MockTransport):
     """A token-exchange endpoint that records every request it was asked.
 
     ``exchange_pat`` builds a *synchronous* ``httpx.Client``, so this is driven
     through ``handle_request`` rather than the async path the proxy's own
     transport uses. Counting matters: several invariants here are about how
     *many* exchanges a scenario costs, not just whether one happened.
+
+    Built from ``httpx`` rather than the SDK's HTTP library on purpose: the
+    exchange is the proxy's own request to the token endpoint and never
+    crosses the SDK boundary, so ``token_exchange`` imports ``httpx``
+    directly. A transport from the other library is silently not used, and
+    the exchange then tries to reach the real network.
     """
 
-    def __init__(self, responder: Callable[[httpx.Request], httpx.Response]) -> None:
-        self.requests: list[httpx.Request] = []
+    def __init__(self, responder: Callable[[exchange_httpx.Request], exchange_httpx.Response]) -> None:
+        self.requests: list[exchange_httpx.Request] = []
 
-        def _recording(request: httpx.Request) -> httpx.Response:
+        def _recording(request: exchange_httpx.Request) -> exchange_httpx.Response:
             self.requests.append(request)
             return responder(request)
 
@@ -266,12 +268,12 @@ class _ExchangeTransport(httpx.MockTransport):
         return len(self.requests)
 
 
-def _minting_exchange() -> Callable[[httpx.Request], httpx.Response]:
+def _minting_exchange() -> Callable[[exchange_httpx.Request], exchange_httpx.Response]:
     """An exchange endpoint that hands out a fresh, distinguishable token each time."""
     tokens = itertools.count(1)
 
-    def responder(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"access_token": f"app-token-{next(tokens)}", "expires_in": 3600})
+    def responder(request: exchange_httpx.Request) -> exchange_httpx.Response:
+        return exchange_httpx.Response(200, json={"access_token": f"app-token-{next(tokens)}", "expires_in": 3600})
 
     return responder
 
@@ -806,7 +808,7 @@ async def test_exchange_failure_exits_one_without_traceback(monkeypatch, mock_wo
     ``diagnosed`` instead. Getting that wrong yields either a traceback, or a
     fatal message followed by exit 0.
     """
-    exchange = _ExchangeTransport(lambda request: httpx.Response(400, json={"error": "invalid audience"}))
+    exchange = _ExchangeTransport(lambda request: exchange_httpx.Response(400, json={"error": "invalid audience"}))
 
     def responder(request: httpx.Request) -> httpx.Response:
         return _initialize_ok()
@@ -907,15 +909,15 @@ async def test_teardown_exchange_failure_is_silent_and_exits_zero(monkeypatch, m
     """
     attempts = itertools.count(1)
 
-    def exchange_responder(request: httpx.Request) -> httpx.Response:
+    def exchange_responder(request: exchange_httpx.Request) -> exchange_httpx.Response:
         if next(attempts) == 1:
             # A positive lifetime below the 60s renewal margin, so the cache is
             # stale the moment it is written and teardown is forced to re-mint.
             # Not ``0``: that is clamped to the default, because a zero or
             # negative lifetime would otherwise cost one blocking exchange per
             # request rather than one per hour.
-            return httpx.Response(200, json={"access_token": "app-token-1", "expires_in": 1})
-        return httpx.Response(400, json={"error": "workspace unreachable"})
+            return exchange_httpx.Response(200, json={"access_token": "app-token-1", "expires_in": 1})
+        return exchange_httpx.Response(400, json={"error": "workspace unreachable"})
 
     exchange = _ExchangeTransport(exchange_responder)
 

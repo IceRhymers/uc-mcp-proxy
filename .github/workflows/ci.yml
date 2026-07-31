@@ -42,3 +42,32 @@ jobs:
 
       - name: Build package
         run: uv build
+
+  # The proxy hands its own HTTP client to the SDK's transport, and SDK 2.0
+  # both renamed that library (httpx -> httpx2) and changed the transport and
+  # message shapes. The locked resolution only ever proves whichever major the
+  # lockfile happens to hold, so each supported major is resolved and tested
+  # explicitly here.
+  test-sdk-majors:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mcp-version: ["mcp>=1.8,<2", "mcp>=2,<3"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f  # v4
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Pin MCP SDK to ${{ matrix.mcp-version }}
+        run: uv pip install "${{ matrix.mcp-version }}"
+
+      - name: Run unit tests
+        run: uv run --no-sync pytest -m unit
+
+      - name: Typecheck
+        run: uv run --no-sync mypy
