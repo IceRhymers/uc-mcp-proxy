@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.0](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.5.1...v0.6.0) (2026-08-01)
+
+
+### Features
+
+* auto-discover the app exchange params, refuse a doomed classic PAT ([cbdbae6](https://github.com/IceRhymers/uc-mcp-proxy/commit/cbdbae6952c8721c69077374eeb94e481b20bcef))
+* reach Databricks Apps from a PAT profile via RFC 8693 token exchange ([1f57152](https://github.com/IceRhymers/uc-mcp-proxy/commit/1f571526da3d613f5ec1b88dfd0445c62b4fbcc3))
+* reach Databricks Apps from a PAT profile via RFC 8693 token exchange ([64d6eab](https://github.com/IceRhymers/uc-mcp-proxy/commit/64d6eab4a90d5861f5c5e5758ff0c827f773fc28)), closes [#24](https://github.com/IceRhymers/uc-mcp-proxy/issues/24)
+* support MCP SDK 2.x alongside 1.x ([5299374](https://github.com/IceRhymers/uc-mcp-proxy/commit/52993740575dd88affbc14ea516c173db6007f8a))
+
+
+### Bug Fixes
+
+* bound supported SDK HTTP dependencies ([4b1adf9](https://github.com/IceRhymers/uc-mcp-proxy/commit/4b1adf9f39503b49f5fada191f67067f5686837f))
+* bound wire bytes, clamp degenerate lifetimes, pin two load-bearing defaults ([c1b7f38](https://github.com/IceRhymers/uc-mcp-proxy/commit/c1b7f383a2b7b7474df47ef24cf0b93946dfad0c))
+* close a leak my own redaction fix introduced, and two it did not cover ([ac6cc34](https://github.com/IceRhymers/uc-mcp-proxy/commit/ac6cc34bd4262f7a8f5c981357c713c0c06d897e))
+* close two credential-leak paths found in review of the PAT exchange ([71ded8a](https://github.com/IceRhymers/uc-mcp-proxy/commit/71ded8a5d61e043d173064fe7d2a56e98140191d))
+* eliminate a ReDoS and stop the read cap from severing secrets ([dc7eab1](https://github.com/IceRhymers/uc-mcp-proxy/commit/dc7eab15e254e24acf1a13f6c40981bcc9f79936))
+* redact by span, and stop the pattern cap from exempting real tokens ([f05e303](https://github.com/IceRhymers/uc-mcp-proxy/commit/f05e3033c9503bd00c3bd13b87223d75829b82b5))
+* stop an OverflowError escaping with the PAT in frame, and three more ([fb48df9](https://github.com/IceRhymers/uc-mcp-proxy/commit/fb48df979f6a627225e6ca248f0bbcc14c451265))
+
 ## [0.5.1](https://github.com/IceRhymers/uc-mcp-proxy/compare/v0.5.0...v0.5.1) (2026-07-30)
 
 
