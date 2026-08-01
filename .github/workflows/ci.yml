@@ -42,3 +42,36 @@ jobs:
 
       - name: Build package
         run: uv build
+
+  # The proxy hands its own HTTP client to the SDK's transport, and SDK 2.0
+  # both renamed that library (httpx -> httpx2) and changed the transport and
+  # message shapes. The locked resolution only ever proves whichever major the
+  # lockfile happens to hold, so each supported major is resolved and tested
+  # explicitly here.
+  test-sdk-majors:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - mcp-version: "mcp>=1.24,<2"
+            http-version: "httpx>=0.28,<0.29"
+          - mcp-version: "mcp>=2,<3"
+            http-version: "httpx2>=2.5,<3"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f  # v4
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Resolve latest supported SDK and HTTP client
+        run: uv pip install --upgrade "${{ matrix.mcp-version }}" "${{ matrix.http-version }}"
+
+      - name: Run unit tests
+        run: uv run --no-sync pytest -m unit
+
+      - name: Typecheck
+        run: uv run --no-sync mypy

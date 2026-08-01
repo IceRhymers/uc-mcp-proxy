@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import httpx
 import pytest
+
+from tests.support import httpx
 
 pytestmark = pytest.mark.unit
 

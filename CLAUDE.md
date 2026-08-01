@@ -39,9 +39,41 @@ Package in `src/uc_mcp_proxy/`:
 - `errors.py` — HTTP error diagnosis and reporting from the remote server
 - `token_exchange.py` — RFC 8693 exchange of a PAT for an app-scoped OAuth token
 - `app_discovery.py` — App-host / classic-PAT detection and lookup of an app's `oauth2_app_client_id` + scopes from workspace metadata (drives auto-exchange)
+- `_compat.py` — MCP SDK major-version shim (see below)
 - `__init__.py` — re-exports `DatabricksAuth`
 
 The proxy bridges an MCP stdio transport to a remote Streamable HTTP MCP server, injecting Databricks OAuth tokens on every request via `DatabricksAuth`.
+
+### SDK compatibility
+
+Both MCP SDK 1.x and 2.x are supported. 2.0 changed three things the proxy
+depends on: the HTTP client library (`httpx` → `httpx2`), the
+`streamable_http_client` yield (dropped the third `get_session_id` element),
+and `SessionMessage.message` (no longer wrapped in a `JSONRPCMessage` root
+model).
+
+The supported dependency ranges are deliberately bounded: `mcp>=1.24,<3`
+matches the API floor and SDK majors exercised by the compatibility shim, while
+`httpx>=0.28,<0.29` and `httpx2>=2.5,<3` prevent untested HTTP-client releases
+from silently changing the retry ordering or redirect-extension behavior. The
+SDK-major CI matrix runs the same retry-invariant tests against the HTTP module
+actually selected by each installed MCP major.
+
+`_compat.py` resolves the HTTP library by reading it back off
+`mcp.client.streamable_http` rather than importing a guessed name — both
+libraries install side by side, so `try: import httpx2` would hand an SDK 1.x
+transport a client built from a library that SDK never imported. Because the
+proxy owns the client it passes to the transport, that mismatch would surface
+as a type error deep in the SDK's request path rather than at import time.
+
+Import `httpx` from `_compat` (tests: from `tests/support.py`) for anything
+that crosses the SDK boundary — the client handed to `streamable_http_client`,
+and every request, response and transport object the SDK's hooks will see.
+
+Code that owns a client end-to-end and never passes it to the SDK may import
+`httpx` directly; `token_exchange.py` does this deliberately, since its RFC
+8693 call to the token endpoint is the proxy's own HTTP request and has
+nothing to do with which library the SDK bound.
 
 ### Error handling
 

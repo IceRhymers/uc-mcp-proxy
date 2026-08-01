@@ -15,8 +15,9 @@ import time
 from collections.abc import AsyncIterator
 
 import anyio
-import httpx
 import pytest
+
+from tests.support import httpx
 
 pytestmark = pytest.mark.unit
 
