@@ -4,16 +4,16 @@ version = "0.5.1"
 description = "MCP stdio-to-Streamable-HTTP proxy with Databricks OAuth"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.8",
+    "mcp>=1.24,<3",
     "databricks-sdk>=0.30.0",
-    # Bounded deliberately. The auth retry depends on two httpx behaviours that
-    # are implementation details rather than documented contracts: response
-    # event hooks running strictly before the auth flow is handed the response,
-    # and ``extensions`` being copied per redirect hop. A test pins both, but
-    # that only protects CI -- an install that resolves a newer httpx would get
-    # a silently broken retry and never run the suite. Raise the cap only after
-    # ``test_response_hook_precedes_auth_flow`` passes on the newer version.
+    # Bounded deliberately. The auth retry depends on two behaviours shared by
+    # httpx (MCP 1.x) and httpx2 (MCP 2.x) that are implementation details rather
+    # than documented contracts: response hooks running strictly before the auth
+    # flow receives the response, and ``extensions`` being copied per redirect
+    # hop. The SDK-major CI matrix runs the invariant tests against each actual
+    # library. Raise either cap only after those tests pass on the newer major.
     "httpx>=0.28,<0.29",
+    "httpx2>=2.5,<3",
     "anyio",
 ]
 license = "MIT"

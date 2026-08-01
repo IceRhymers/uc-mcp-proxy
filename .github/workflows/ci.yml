@@ -52,7 +52,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        mcp-version: ["mcp>=1.8,<2", "mcp>=2,<3"]
+        include:
+          - mcp-version: "mcp>=1.24,<2"
+            http-version: "httpx>=0.28,<0.29"
+          - mcp-version: "mcp>=2,<3"
+            http-version: "httpx2>=2.5,<3"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
@@ -63,8 +67,8 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Pin MCP SDK to ${{ matrix.mcp-version }}
-        run: uv pip install "${{ matrix.mcp-version }}"
+      - name: Resolve latest supported SDK and HTTP client
+        run: uv pip install --upgrade "${{ matrix.mcp-version }}" "${{ matrix.http-version }}"
 
       - name: Run unit tests
         run: uv run --no-sync pytest -m unit

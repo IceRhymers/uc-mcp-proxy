@@ -52,6 +52,13 @@ depends on: the HTTP client library (`httpx` → `httpx2`), the
 and `SessionMessage.message` (no longer wrapped in a `JSONRPCMessage` root
 model).
 
+The supported dependency ranges are deliberately bounded: `mcp>=1.24,<3`
+matches the API floor and SDK majors exercised by the compatibility shim, while
+`httpx>=0.28,<0.29` and `httpx2>=2.5,<3` prevent untested HTTP-client releases
+from silently changing the retry ordering or redirect-extension behavior. The
+SDK-major CI matrix runs the same retry-invariant tests against the HTTP module
+actually selected by each installed MCP major.
+
 `_compat.py` resolves the HTTP library by reading it back off
 `mcp.client.streamable_http` rather than importing a guessed name — both
 libraries install side by side, so `try: import httpx2` would hand an SDK 1.x

@@ -602,10 +602,11 @@ async def test_response_hook_precedes_auth_flow():
     reaches the first 401 first and aborts the process before the retry can ever
     be dispatched, so the retry would be present, correct, and dead.
 
-    It is an httpx *internal*, not a documented contract. ``pyproject.toml``
-    caps httpx below the next minor precisely because of it; this test is the
-    gate for raising that cap. A reordering then shows up as a loud CI failure
-    rather than a feature that silently stops retrying.
+    It is an HTTP-client *internal*, not a documented contract.
+    ``pyproject.toml`` caps both httpx (MCP 1.x) and httpx2 (MCP 2.x) precisely
+    because of it. The SDK-major CI matrix runs this test against each library,
+    making it the gate for raising either cap. A reordering then shows up as a
+    loud CI failure rather than a feature that silently stops retrying.
     """
     order: list[str] = []
 

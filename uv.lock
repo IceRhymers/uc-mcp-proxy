@@ -1476,6 +1476,7 @@ dependencies = [
     { name = "anyio" },
     { name = "databricks-sdk" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "mcp" },
 ]
 
@@ -1494,7 +1495,8 @@ requires-dist = [
     { name = "anyio" },
     { name = "databricks-sdk", specifier = ">=0.30.0" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
-    { name = "mcp", specifier = ">=1.8" },
+    { name = "httpx2", specifier = ">=2.5,<3" },
+    { name = "mcp", specifier = ">=1.24,<3" },
 ]
 
 [package.metadata.requires-dev]
