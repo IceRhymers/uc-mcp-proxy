@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 import time
@@ -244,7 +245,8 @@ async def copy_stream(source: MessageReceiveStream, dest: MessageSendStream) -> 
         async for message in source:
             await dest.send(message)
     finally:
-        await dest.aclose()
+        with contextlib.suppress(Exception):
+            await dest.aclose()
 
 
 def inject_meta(
@@ -268,6 +270,12 @@ def inject_meta(
     if root.params is None:
         root.params = {}
     existing = root.params.get("_meta") or {}
+    if not isinstance(existing, dict):
+        print(
+            "warning: client _meta is not an object; replacing with proxy _meta",
+            file=sys.stderr,
+        )
+        existing = {}
     for key, value in meta.items():
         if key in existing:
             print(
@@ -289,7 +297,8 @@ async def inject_meta_stream(
         async for message in source:
             await dest.send(inject_meta(message, meta))
     finally:
-        await dest.aclose()
+        with contextlib.suppress(Exception):
+            await dest.aclose()
 
 
 async def bridge(
@@ -825,6 +834,9 @@ def main() -> None:
             key, _, value = m.partition("=")
             if not value:
                 print(f"Error: --meta must be KEY=VALUE, got: {m!r}", file=sys.stderr)
+                sys.exit(1)
+            if not key:
+                print(f"Error: --meta must be KEY=VALUE with a non-empty key, got: {m!r}", file=sys.stderr)
                 sys.exit(1)
             meta[key] = value
 

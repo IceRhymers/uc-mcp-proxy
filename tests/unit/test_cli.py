@@ -194,6 +194,27 @@ def test_meta_without_value_exits_with_error():
         assert exc_info.value.code == 1
 
 
+def test_meta_empty_key_exits_with_error(capsys):
+    """--meta =value (empty key) produces a non-zero exit."""
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "uc-mcp-proxy",
+            "--url",
+            "https://example.com/mcp",
+            "--meta",
+            "=value",
+        ],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            from uc_mcp_proxy.__main__ import main
+
+            main()
+        assert exc_info.value.code == 1
+    assert "non-empty key" in capsys.readouterr().err
+
+
 def test_no_meta_passes_none():
     """No --meta flags → meta=None."""
     with patch.object(sys, "argv", ["uc-mcp-proxy", "--url", "https://example.com/mcp"]):
