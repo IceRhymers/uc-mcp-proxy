@@ -114,3 +114,37 @@ async def test_bridge_exits_on_stream_close(stdio_streams, http_streams):
 
     # Should complete without raising
     await bridge(stdio_recv, stdio_write, http_recv, http_write)
+
+
+async def test_copy_stream_aclose_error_does_not_mask(memory_stream_pair):
+    """An aclose failure must not replace the send failure that caused it."""
+    from uc_mcp_proxy.__main__ import copy_stream
+
+    source_send, source_recv = memory_stream_pair(4)
+
+    class _FailingDest:
+        async def send(self, item):
+            raise RuntimeError("boom")
+
+        async def aclose(self):
+            raise RuntimeError("close-boom")
+
+    await source_send.send("message-1")
+    await source_send.aclose()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await copy_stream(source_recv, _FailingDest())
+    assert exc_info.value.args == ("boom",)
+
+
+async def test_copy_stream_double_close_is_quiet(memory_stream_pair):
+    """Closing an already-closed dest must not raise."""
+    from uc_mcp_proxy.__main__ import copy_stream
+
+    source_send, source_recv = memory_stream_pair(4)
+    dest_send, _dest_recv = memory_stream_pair(4)
+
+    await source_send.aclose()
+    await dest_send.aclose()
+
+    await copy_stream(source_recv, dest_send)

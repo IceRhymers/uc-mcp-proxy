@@ -170,3 +170,41 @@ async def test_inject_meta_stream_passes_exception_through(memory_stream_pair):
             results.append(m)
 
     assert results == [err]
+
+
+@pytest.mark.parametrize("bad_meta", [["oops"], "oops", 42])
+def test_inject_meta_replaces_non_dict_meta(bad_meta, capsys):
+    """A truthy non-dict client _meta is replaced, not crashed on."""
+    from uc_mcp_proxy.__main__ import inject_meta
+
+    params = {"name": "q", "arguments": {}, "_meta": bad_meta}
+    out = inject_meta(_tools_call(params), {"warehouse_id": "abc123"})
+
+    assert jsonrpc_payload(out).params["_meta"] == {"warehouse_id": "abc123"}
+    assert "not an object" in capsys.readouterr().err
+
+
+@pytest.mark.anyio
+async def test_inject_meta_stream_survives_non_dict_meta(memory_stream_pair):
+    """One malformed _meta must not kill the stream for later messages."""
+    from uc_mcp_proxy.__main__ import inject_meta_stream
+
+    source_send, source_recv = memory_stream_pair(16)
+    dest_send, dest_recv = memory_stream_pair(16)
+
+    bad = _tools_call({"name": "q", "arguments": {}, "_meta": ["oops"]})
+    good = _tools_call()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(inject_meta_stream, source_recv, dest_send, {"warehouse_id": "abc"})
+        await source_send.send(bad)
+        await source_send.send(good)
+        await source_send.aclose()
+
+    results = []
+    async with dest_recv:
+        async for m in dest_recv:
+            results.append(m)
+
+    assert len(results) == 2
+    assert all(jsonrpc_payload(m).params["_meta"] == {"warehouse_id": "abc"} for m in results)
